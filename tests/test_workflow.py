@@ -173,7 +173,7 @@ def test_imap_worker_processes_trusted_timestamp_and_deduplicates(monkeypatch):
     from email.utils import format_datetime
     from datetime import datetime, timezone, timedelta
     did,a=approval(); received=datetime.now(timezone.utc)
-    message=(f'From: approver@example.com\r\nSubject: reply\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nApproval ID: {a["id"]}\r\nDecision: APPROVED\r\n').encode()
+    message=(f'From: approver@example.com\r\nSubject: reply\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nApproval ID: {a["id"]} Decision: APPROVED\r\n').encode()
     class FakeIMAP:
         def __init__(self,*a,**k): pass
         def __enter__(self): return self
@@ -343,7 +343,7 @@ def test_langchain_ai_evaluation_uses_precomputed_metrics(monkeypatch):
             received['schema']=schema; received['method']=method; return self
         def invoke(self, messages):
             received['messages']=messages
-            return {'classification':'NEGOTIATE','explanation':'Price requires review.','strengths':['Location stated'],'risks':['Verify repairs'],'passed':['Minimum ARV'],'failed':[],'suggested_next_action':'Request more details.'}
+            return {'classification':'NEGOTIATE','explanation':'Price requires review.','financial_assessment':'Review the calculated maximum offer.','criteria_assessment':'Compare the offer with the buying criteria.','due_diligence':['Verify repair estimates.'],'strengths':['Location stated'],'risks':['Verify repairs'],'passed':['Minimum ARV'],'failed':[],'recommended_action':'NEGOTIATE','suggested_next_action':'Request more details.'}
     monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
     rule={'classification':'POTENTIAL_MATCH','metrics':{'mao':119000},'criteria':{},'missing':[]}
     result=evaluation_agent.assess_property({'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000},rule)
@@ -490,7 +490,7 @@ def test_ai_assessment_cannot_classify_missing_core_data_as_match(monkeypatch):
         def __init__(self,**kwargs): pass
         def with_structured_output(self,*args,**kwargs): return self
         def invoke(self,messages):
-            return {'classification':'STRONG_MATCH','explanation':'Looks strong','strengths':[],'risks':[],'passed':[],'failed':[],'suggested_next_action':'Review'}
+            return {'classification':'STRONG_MATCH','explanation':'Looks strong','financial_assessment':'Review the numbers.','criteria_assessment':'Compare the buying criteria.','due_diligence':[],'strengths':[],'risks':[],'passed':[],'failed':[],'recommended_action':'PROCEED_TO_DUE_DILIGENCE','suggested_next_action':'Review'}
     monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
     with pytest.raises(ValueError): evaluation_agent.assess_property({'asking_price':100000,'arv':None,'repairs':None},{'metrics':{},'criteria':{},'missing':['arv','repairs']})
 
@@ -513,7 +513,7 @@ def test_approval_notification_explains_deal_and_unknown_costs():
     evaluation={'classification':'POTENTIAL_MATCH','evaluation_source':'openai','initial_draft_source':'openai','explanation':'Asking price is below the calculated offer.','suggested_next_action':'Request photos.','metrics':{'mao':119000,'gross_spread':70000,'estimated_profit':None,'roi_percent':None},'risks':['Estimates are unverified'],'passed':['Repair limit'],'failed':[],'missing':['address'],'assumptions':['Unknown costs are not zero']}
     draft={'recipient':'seller@example.com','subject':'Re: Offer','body':'Please share photos.'}
     message=build_notification('RE-123','2026-01-01T00:20:00+00:00',property_details,evaluation,draft)
-    assert 'OpenAI-assisted evaluation' in message and 'Asking price is below the calculated offer.' in message
+    assert 'AI Deal Evaluation Agent' in message and 'Asking price is below the calculated offer.' in message
     assert '$119,000.00' in message and '$70,000.00' in message
     assert 'Estimated net profit (calculated): Not available' in message
     assert 'Estimates are unverified' in message and 'Request photos.' in message
@@ -544,3 +544,278 @@ def test_cancel_pending_approval_allows_reanalysis_and_blocks_late_reply():
     assert reply(a).status_code==409
     assert client.post(f'/api/deals/{did}/reanalyze').status_code==200
     with db() as c: assert c.execute('SELECT count(*) FROM executions WHERE approval_id=?',(a['id'],)).fetchone()[0]==0
+
+def test_approval_email_sections_and_bold_disclaimer():
+    from backend.services.approval_notification import build_notification, notification_html, DISCLAIMER
+    details={'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000}
+    evaluation={'classification':'POTENTIAL_MATCH','evaluation_source':'openai','initial_draft_source':'openai','explanation':'Verify the repair estimate.','suggested_next_action':'Request photos.','metrics':{},'risks':[],'passed':[],'failed':[],'missing':[],'assumptions':[]}
+    draft={'recipient':'seller@example.com','subject':'Re: Offer','body':'Please share <script>alert(1)</script> photos.'}
+    text=build_notification('RE-123','2026-01-01T00:20:00+00:00',details,evaluation,draft,timeout_minutes=20)
+    sections=['DISCLAIMER:', 'PROPERTY DETAILS','AI RECOMMENDATION','PROPOSED RESPONSE TO THE WHOLESALER','APPROVAL ID AND DEADLINE','APPROVAL REQUEST']
+    positions=[text.index(s) for s in sections]
+    assert positions==sorted(positions)
+    assert 'Time to reply: 20 minutes' in text and 'Please share <script>alert(1)</script> photos.' in text
+    rendered=notification_html(text)
+    assert '<strong>'+DISCLAIMER+'</strong>' in rendered
+    assert '<script>' not in rendered and '&lt;script&gt;' in rendered
+
+def test_approval_sends_plain_and_bold_html_versions(monkeypatch):
+    from backend.services import approval_service
+    captured=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: captured.append((args,kwargs)) or 'SMTP_ACCEPTED')
+    did,a=approval()
+    assert len(captured)==1
+    args,kwargs=captured[0]
+    assert a['notification']==args[2]
+    assert '<strong>DISCLAIMER:' in kwargs['html_body']
+    assert kwargs['reply_to']=='inbox@example.com'
+    stored=client.get('/api/deals/'+did).json()
+    assert stored['approvals'][0]['notification']==a['notification']
+    assert any(e['event']=='buyer_review_prepared' for e in stored['activity'])
+
+def test_notification_hides_empty_criteria_and_uses_clear_comments():
+    from backend.services.approval_notification import build_notification, notification_html
+    details={'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000}
+    evaluation={'classification':'POTENTIAL_MATCH','evaluation_source':'openai','metrics':{},'passed':[],'failed':[],'risks':[],'missing':[],'assumptions':[]}
+    draft={'recipient':'seller@example.com','subject':'Offer','body':'Please share photos.'}
+    text=build_notification('RE-123','2026-01-01T00:20:00+00:00',details,evaluation,draft)
+    assert 'CRITERIA MET' not in text and 'CRITERIA NOT MET' not in text
+    assert 'None recorded' not in text and 'AI Deal Evaluation Agent' in text
+    assert 'Comments: followed by your comments, if any' in text
+    html=notification_html(text)
+    for heading in ('PROPERTY DETAILS','FINANCIAL DETAILS','AI RECOMMENDATION','PROPOSED RESPONSE TO THE WHOLESALER','APPROVAL ID AND DEADLINE','APPROVAL REQUEST'):
+        assert '<strong>'+heading+'</strong>' in html
+    assert 'background:#f2f7f3' in html and 'Please share photos.' in html
+
+def test_buyer_message_preview_matches_saved_request_without_sending(monkeypatch):
+    from backend.services import approval_service
+    sent=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    did=create()
+    preview=client.get(f'/api/deals/{did}/approval-preview')
+    assert preview.status_code==200 and preview.json()['preview'] is True
+    assert 'DISCLAIMER:' in preview.json()['notification']
+    assert 'PROPOSED RESPONSE TO THE WHOLESALER' in preview.json()['notification']
+    assert 'Assigned when requested' in preview.json()['notification']
+    assert sent==[]
+    with db() as c: assert c.execute('SELECT count(*) FROM approvals').fetchone()[0]==0
+    actual=client.post(f'/api/deals/{did}/approvals').json()
+    expected=actual['notification'].replace(actual['id'],'Assigned when requested').replace(actual['deadline'],'Assigned when requested')
+    assert preview.json()['notification']==expected
+    assert len(sent)==1
+
+def test_buyer_message_preview_reflects_saved_draft():
+    did=create(); draft=client.get('/api/deals/'+did).json()['draft']
+    draft['body']='Please send the inspection report.'
+    assert client.put(f'/api/deals/{did}/draft',json=draft).status_code==200
+    assert 'Please send the inspection report.' in client.get(f'/api/deals/{did}/approval-preview').json()['notification']
+
+def test_buyer_notification_includes_detailed_ai_analysis():
+    from backend.services.approval_notification import build_notification,notification_html
+    p={'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000}
+    ev={'classification':'POTENTIAL_MATCH','evaluation_source':'openai','explanation':'Review this opportunity.','financial_assessment':'The asking price is below the calculated maximum offer. Net profit is unknown.','criteria_assessment':'The estimated repairs meet the configured repair limit.','due_diligence':['Verify repair estimates and comparable sales.'],'suggested_next_action':'Request documentation.','metrics':{},'missing':[]}
+    body=build_notification('RE-123','2026-01-01T00:20:00+00:00',p,ev,{'recipient':'seller@example.com','subject':'Offer','body':'Please send details.'})
+    assert 'FINANCIAL VIEW' in body and ev['financial_assessment'] in body
+    assert 'FIT WITH BUYING CRITERIA' in body and ev['criteria_assessment'] in body
+    assert 'DUE DILIGENCE QUESTIONS' in body and ev['due_diligence'][0] in body
+    html=notification_html(body)
+    assert '<strong>FINANCIAL VIEW</strong>' in html
+
+def test_ai_assessment_rejects_unverified_numbers(monkeypatch):
+    from backend.agents import evaluation_agent
+    class FakeModel:
+        def __init__(self,**kwargs): pass
+        def with_structured_output(self,*args,**kwargs): return self
+        def invoke(self,messages):
+            return {'classification':'POTENTIAL_MATCH','explanation':'Looks promising.','financial_assessment':'Estimated profit is $999,999.','criteria_assessment':'Review criteria.','due_diligence':[],'strengths':[],'risks':[],'passed':[],'failed':[],'recommended_action':'PROCEED_TO_DUE_DILIGENCE','suggested_next_action':'Review'}
+    monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
+    with pytest.raises(ValueError):
+        evaluation_agent.assess_property({'asking_price':115000,'arv':220000,'repairs':35000},{'metrics':{'estimated_profit':None},'criteria':{},'missing':[]})
+
+def test_financial_abbreviations_expand_without_duplication():
+    from backend.agents.terms import expand_financial_terms
+    assert expand_financial_terms('ARV, MAO and ROI')=='ARV (After Repair Value), MAO (Maximum Allowable Offer) and ROI (Return on Investment)'
+    assert expand_financial_terms('ARV (After Repair Value) and Return on Investment (ROI)')=='ARV (After Repair Value) and Return on Investment (ROI)'
+
+def test_buyer_notification_expands_metrics_without_changing_frozen_reply():
+    from backend.services.approval_notification import build_notification
+    p={'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000}
+    ev={'classification':'POTENTIAL_MATCH','evaluation_source':'openai','explanation':'Verify the ARV and ROI.','metrics':{'mao':119000,'roi_percent':None},'passed':['minimum ARV'],'missing':['arv'],'risks':['ROI is not confirmed'],'assumptions':[]}
+    frozen={'recipient':'seller@example.com','subject':'Offer','body':'Please confirm the ARV.'}
+    message=build_notification('RE-123','2026-01-01T00:20:00+00:00',p,ev,frozen)
+    assert 'ARV (After Repair Value)' in message
+    assert 'MAO (Maximum Allowable Offer)' in message
+    assert 'ROI (Return on Investment)' in message
+    assert 'To: seller@example.com\nSubject: Offer\n\nPlease confirm the ARV.' in message
+    assert frozen['body']=='Please confirm the ARV.'
+
+def test_same_line_approval_and_decision_is_accepted(monkeypatch):
+    from backend.services import approval_service
+    sent=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    did,a=approval()
+    text=f"Approval ID: {a['id']} Decision: APPROVED\n\nOn Sunday someone wrote:\n> Decision: REJECTED"
+    result=reply(a,text=text)
+    assert result.json()['execution']=='SMTP_ACCEPTED'
+    assert len(sent)==2
+    assert client.get('/api/deals/'+did).json()['approvals'][0]['status']=='APPROVED'
+
+def test_same_line_ambiguous_decisions_remain_rejected():
+    from backend.services.approval_service import parse_approval_reply
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        parse_approval_reply('Approval ID: RE-123 Decision: APPROVED Decision: REJECTED')
+
+def test_same_line_fields_include_comment():
+    from backend.services.approval_service import parse_approval_reply
+    assert parse_approval_reply('Approval ID: RE-123 Decision: APPROVED Comments: Please send photos') == ('RE-123','APPROVED','Please send photos')
+
+def test_email_action_links_prefill_decision_and_optional_comment():
+    from html.parser import HTMLParser
+    from urllib.parse import urlparse, parse_qs, unquote
+    from backend.services.approval_notification import build_notification,notification_html
+    from backend.services.approval_service import parse_approval_reply
+    class Links(HTMLParser):
+        def __init__(self): super().__init__(); self.hrefs=[]
+        def handle_starttag(self,tag,attrs):
+            if tag=='a': self.hrefs.append(dict(attrs).get('href',''))
+    p={'city':'Dallas'}; ev={'classification':'INSUFFICIENT_DATA','metrics':{}}
+    draft={'recipient':'seller@example.com','subject':'Offer','body':'Please share details.'}
+    body=build_notification('RE-123','2026-01-01T00:20:00+00:00',p,ev,draft)
+    html=notification_html(body,approval_id='RE-123',reply_to='approvals@example.com')
+    parser=Links(); parser.feed(html)
+    assert len(parser.hrefs)==2 and '>Approve</a>' in html and '>Reject</a>' in html
+    for href,decision in zip(parser.hrefs,('APPROVED','REJECTED')):
+        parsed=urlparse(href); values=parse_qs(parsed.query)
+        assert parsed.scheme=='mailto' and unquote(parsed.path)=='approvals@example.com'
+        assert parse_approval_reply(values['body'][0])==('RE-123',decision,'')
+        assert 'Comments:' in values['body'][0]
+    second=notification_html(body,approval_id='RE-123',reply_to='approvals@example.com',is_second_review=True)
+    parser=Links();parser.feed(second)
+    assert all('Comments:' not in parse_qs(urlparse(href).query)['body'][0] for href in parser.hrefs)
+
+def test_email_action_links_reject_invalid_reply_address():
+    from backend.services.approval_notification import notification_html
+    with pytest.raises(ValueError):
+        notification_html('text',approval_id='RE-123',reply_to='inbox@example.com\nBcc: attacker@example.com')
+
+def test_button_prefilled_email_uses_normal_approval_validation(monkeypatch):
+    from html.parser import HTMLParser
+    from urllib.parse import urlparse, parse_qs
+    from backend.services import approval_service
+    sent=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append((args,kwargs)) or 'SMTP_ACCEPTED')
+    class Links(HTMLParser):
+        def __init__(self): super().__init__(); self.hrefs=[]
+        def handle_starttag(self,tag,attrs):
+            if tag=='a': self.hrefs.append(dict(attrs)['href'])
+    did,a=approval()
+    parser=Links();parser.feed(sent[0][1]['html_body'])
+    assert len(sent)==1  # Rendering or opening a link does not send a wholesaler message.
+    body=parse_qs(urlparse(parser.hrefs[0]).query)['body'][0]+'Please share photos'
+    result=reply(a,sender='attacker@example.com',text=body)
+    assert result.status_code==403 and len(sent)==1
+    result=reply(a,text=body)
+    assert result.json()['status']=='APPROVED' and result.json()['execution']=='SMTP_ACCEPTED'
+    assert len(sent)==2
+    assert client.get('/api/deals/'+did).json()['approvals'][0]['comments']=='Please share photos'
+
+def test_all_configured_buying_criteria_are_reported():
+    from backend.tools.buying_criteria import criteria_checks
+    p={'asking_price':115000,'arv':220000,'repairs':35000,'property_type':'single-family house'}
+    checks=criteria_checks(p,DEFAULT_CRITERIA,metrics(p,DEFAULT_CRITERIA))
+    assert len(checks)==7
+    assert all(item['status']=='MET' for item in checks[:6])
+    assert checks[-1]['name']=='Investment strategy' and checks[-1]['status']=='INFORMATIONAL'
+    unknown=criteria_checks({'asking_price':115000},DEFAULT_CRITERIA,metrics({'asking_price':115000},DEFAULT_CRITERIA))
+    assert unknown[0]['status']=='MET'
+    assert all(item['status']=='UNKNOWN' for item in unknown[1:6])
+
+def test_contradictory_values_do_not_count_as_passed():
+    from backend.tools.buying_criteria import criteria_checks
+    p={'asking_price':115000,'arv':220000,'repairs':35000,'property_type':'single-family','contradictions':['Conflicting asking prices']}
+    checks=criteria_checks(p,DEFAULT_CRITERIA,metrics(p,DEFAULT_CRITERIA))
+    assert all(item['status']=='UNKNOWN' for item in checks[:6])
+
+def test_ai_cannot_call_failed_repair_limit_a_potential_match(monkeypatch):
+    from backend.agents import evaluation_agent
+    class FakeModel:
+        def __init__(self,**kwargs): pass
+        def with_structured_output(self,*args,**kwargs): return self
+        def invoke(self,messages):
+            return {'classification':'POTENTIAL_MATCH','explanation':'Further review needed.','financial_assessment':'Review costs.','criteria_assessment':'Repairs exceed the limit.','due_diligence':[],'strengths':[],'risks':['Repair limit exceeded.'],'passed':[],'failed':['Maximum repair cost'],'recommended_action':'REQUEST_INFORMATION','suggested_next_action':'Request information.'}
+    monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
+    p={'asking_price':125000,'arv':230000,'repairs':85000}
+    context={'metrics':metrics(p,DEFAULT_CRITERIA),'criteria':DEFAULT_CRITERIA,'criteria_results':[{'name':'Maximum repair cost','status':'NOT_MET','requirement':'At most $60,000'}]}
+    with pytest.raises(ValueError): evaluation_agent.assess_property(p,context)
+
+def test_buyer_notification_shows_all_criteria_and_unknowns():
+    from backend.services.approval_notification import build_notification
+    from backend.tools.buying_criteria import criteria_checks
+    p={'asking_price':115000}
+    calculated=metrics(p,DEFAULT_CRITERIA)
+    checks=criteria_checks(p,DEFAULT_CRITERIA,calculated)
+    ev={'classification':'INSUFFICIENT_DATA','metrics':calculated,'criteria_results':checks,'missing':['arv','repairs']}
+    text=build_notification('RE-123','2026-01-01T00:20:00Z',p,ev,{'recipient':'seller@example.com','subject':'Offer','body':'Please share details.'})
+    assert 'BUYING CRITERIA' in text and 'Maximum purchase price: Met' in text
+    assert 'Minimum after repair value: Unknown' in text
+    assert 'Investment strategy: Configured' in text
+    assert 'CRITERIA MET\n' not in text  # no duplicated lists when detailed criteria exist
+
+def test_unknown_property_type_stays_unknown():
+    from backend.tools.buying_criteria import criteria_checks
+    p={'asking_price':115000,'arv':220000,'repairs':35000,'property_type':'Unknown'}
+    assert criteria_checks(p,DEFAULT_CRITERIA,metrics(p,DEFAULT_CRITERIA))[5]['status']=='UNKNOWN'
+
+def test_ai_verdict_and_recommended_action_must_agree(monkeypatch):
+    from backend.agents import evaluation_agent
+    class FakeModel:
+        def __init__(self,**kwargs): pass
+        def with_structured_output(self,*args,**kwargs): return self
+        def invoke(self,messages):
+            return {'classification':'REJECT','explanation':'The repairs exceed the limit.','financial_assessment':'The estimate needs review.','criteria_assessment':'The repair criterion is not met.','due_diligence':[],'strengths':[],'risks':['Repair costs exceed the limit.'],'passed':[],'failed':['Maximum repair cost'],'recommended_action':'PROCEED_TO_DUE_DILIGENCE','suggested_next_action':'Review the opportunity.'}
+    monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
+    p={'asking_price':125000,'arv':230000,'repairs':85000}
+    with pytest.raises(ValueError): evaluation_agent.assess_property(p,{'metrics':metrics(p,DEFAULT_CRITERIA),'criteria':DEFAULT_CRITERIA})
+
+def test_activity_records_approver_comment_and_wholesaler_send_stages(monkeypatch):
+    from backend.services import approval_service
+    sent=[]
+    def transport(*args,**kwargs):
+        if not kwargs.get('reply_to'):
+            with db() as c:
+                assert c.execute("SELECT status FROM executions LIMIT 1").fetchone()['status']=='SENDING'
+                assert c.execute("SELECT count(*) FROM audit WHERE event='wholesaler_send_started'").fetchone()[0]==1
+        sent.append(args)
+        return 'SMTP_ACCEPTED'
+    monkeypatch.setattr(approval_service.email_service,'send_message',transport)
+    did,a=approval()
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: Please share photos")
+    assert result.json()['execution']=='SMTP_ACCEPTED'
+    events=client.get('/api/deals/'+did).json()['activity']
+    relevant=[entry for entry in events if entry['event'] in ('approval_decision','final_reply_prepared','wholesaler_send_started','email_execution')]
+    assert [entry['event'] for entry in relevant]==['approval_decision','final_reply_prepared','wholesaler_send_started','email_execution']
+    assert relevant[0]['details']['sender']=='approver@example.com'
+    assert relevant[0]['details']['comment']=='Please share photos'
+    assert relevant[0]['details']['received_at']
+    assert all(entry['details']['recipient']=='fictional@example.com' for entry in relevant[1:])
+    assert relevant[-1]['details']['status']=='SMTP_ACCEPTED'
+
+def test_rejected_approval_activity_records_reviewer_and_decline_recipient():
+    did,a=approval()
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: REJECTED\nComments: Not within our budget")
+    assert result.json()['status']=='REJECTED'
+    events=client.get('/api/deals/'+did).json()['activity']
+    decision=next(e for e in events if e['event']=='approval_decision')
+    outcome=next(e for e in events if e['event']=='email_execution')
+    assert decision['details']['status']=='REJECTED' and decision['details']['comment']=='Not within our budget'
+    assert outcome['details']['recipient']=='fictional@example.com'
+    assert outcome['details']['decision']=='REJECTED'
+
+def test_old_execution_events_include_recorded_recipient():
+    import json
+    did,a=approval(); assert reply(a).status_code==200
+    with db() as c:
+        c.execute("UPDATE audit SET details=? WHERE event='email_execution'",(json.dumps({'approval_id':a['id'],'status':'SMTP_ACCEPTED'}),))
+    event=next(e for e in client.get('/api/deals/'+did).json()['activity'] if e['event']=='email_execution')
+    assert event['details']['recipient']=='fictional@example.com'

@@ -1,14 +1,10 @@
-import hashlib, json, os, re, sqlite3, uuid
-from datetime import datetime, timedelta, timezone
+import json, re, sqlite3, uuid
 from pathlib import Path
-from contextlib import contextmanager
-from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import openai
-from backend.core import DEFAULT_CRITERIA, run_workflow
+from backend.core import run_workflow
 
 from backend.database import db, init, now, stamp, payload_hash
 init()
@@ -16,6 +12,7 @@ app = APIRouter()
 
 from backend.database import audit, row, unpack
 from backend.services import approval_service
+from backend.services.approval_notification import build_notification
 from backend import config
 class EmailInput(BaseModel):
     sender: str = Field(min_length=3,max_length=320)
@@ -25,9 +22,6 @@ class Draft(BaseModel):
     recipient: str = Field(min_length=3,max_length=320)
     subject: str = Field(min_length=1,max_length=500)
     body: str = Field(min_length=1,max_length=30000)
-class Decision(BaseModel):
-    sender: str
-    text: str
 class Criteria(BaseModel):
     max_price: float = Field(ge=0)
     min_arv: float = Field(ge=0)
@@ -149,14 +143,33 @@ def deal(deal_id: str):
         for event in c.execute('SELECT at,event,details FROM audit ORDER BY id'):
             details=json.loads(event['details'])
             if details.get('deal_id')==deal_id or details.get('approval_id') in approval_ids:
+                approval=next((a for a in d['approvals'] if a['id']==details.get('approval_id')),None)
                 if event['event']=='approval_decision':
-                    approval=next((a for a in d['approvals'] if a['id']==details.get('approval_id')),None)
                     if approval:
                         details.setdefault('sender',approval.get('sender'))
                         details.setdefault('comment',approval.get('comments'))
+                        details.setdefault('received_at',approval.get('decided_at'))
+                if event['event'] in ('final_reply_prepared','wholesaler_send_started','email_execution','reply_requires_review') and approval and approval.get('execution'):
+                    try:
+                        sent_payload=json.loads(approval['execution']['payload'])
+                        details.setdefault('recipient',sent_payload.get('recipient'))
+                    except (ValueError,TypeError,KeyError):
+                        pass
                 events.append({'at':event['at'],'event':event['event'],'details':details})
         d['activity']=sorted(events,key=lambda e:e['at'])
         return d
+
+@app.get('/api/deals/{deal_id}/approval-preview')
+def approval_preview(deal_id: str):
+    with db() as c:
+        current=unpack(row(c,'deals',deal_id),['property','evaluation','draft'])
+    text=build_notification(
+        'Assigned when requested','Assigned when requested',
+        current['property'],current['evaluation'],current['draft'],
+        second_review_enabled=config.SECOND_DRAFT_APPROVAL_ENABLED,
+        timeout_minutes=config.APPROVAL_TIMEOUT_MINUTES,
+    )
+    return {'notification':text,'preview':True}
 @app.put('/api/deals/{deal_id}/draft')
 def save_draft(deal_id: str, d: Draft):
     if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',d.recipient): raise HTTPException(422,'Invalid recipient')

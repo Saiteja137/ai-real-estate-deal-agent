@@ -1,11 +1,11 @@
 import email, imaplib, logging, os, re, threading
-from datetime import datetime, timezone
+from datetime import timezone
 from email import policy
 from email.utils import parseaddr, parsedate_to_datetime
 from fastapi import HTTPException
 from backend import config
 from backend.database import db, now, stamp, audit
-from backend.services.approval_service import process_reply
+from backend.services.approval_service import process_reply, parse_approval_reply
 
 log=logging.getLogger(__name__)
 
@@ -35,14 +35,17 @@ def poll_once():
             sender=parseaddr(msg.get('From',''))[1]
             part=msg.get_body(preferencelist=('plain',)) if msg.is_multipart() else msg
             text=part.get_content() if part and part.get_content_type()=='text/plain' else ''
-            match=re.search(r'(?im)^\s*Approval ID:\s*(RE-[A-F0-9]+)\s*$',text if isinstance(text,str) else '')
             result='IGNORED'
-            if match:
-                try: result=process_reply(match.group(1),sender,text,received)['status']
+            try:
+                approval_id, _, _ = parse_approval_reply(text if isinstance(text,str) else '')
+            except HTTPException:
+                approval_id=None
+            if approval_id:
+                try: result=process_reply(approval_id,sender,text,received)['status']
                 except HTTPException as exc:
                     result='REJECTED_INPUT_'+str(exc.status_code)
                     with db() as c:
-                        audit(c,'approval_reply_ignored',{'approval_id':match.group(1),'reason':result})
+                        audit(c,'approval_reply_ignored',{'approval_id':approval_id,'reason':result})
             with db() as c:
                 c.execute('INSERT OR IGNORE INTO mailbox_messages VALUES (?,?,?)',(key,stamp(received),result))
         # Expire only after a successful complete mailbox scan, for deadlines already past at scan start.

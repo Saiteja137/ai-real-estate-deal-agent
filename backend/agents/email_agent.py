@@ -1,6 +1,7 @@
 import os
 from backend import config
 from backend.agents.guardrails import REAL_ESTATE_DRAFT_INSTRUCTIONS, validate_reply
+from backend.agents.terms import expand_financial_terms
 
 def polish_followup(body, comment, decision):
     """Prepare text for human review; the result is never authorized to send here."""
@@ -13,11 +14,11 @@ def polish_followup(body, comment, decision):
         instructions=REAL_ESTATE_DRAFT_INSTRUCTIONS,
         input=json.dumps({'draft': body, 'approver_comment': comment, 'decision': decision}),
     )
-    return validate_reply(result.output_text, {'draft':body,'comment':comment}), 'openai'
+    return expand_financial_terms(validate_reply(result.output_text, {'draft':body,'comment':comment})), 'openai'
 
 def draft(p, ev, sender, subject):
     category = ev['classification']
-    if category == 'INSUFFICIENT_DATA': content = 'Before completing our initial evaluation, could you please provide: ' + ', '.join(ev['missing']).replace('_',' ') + '?'
+    if category == 'INSUFFICIENT_DATA': content = 'Before completing our initial evaluation, could you please provide: ' + expand_financial_terms(', '.join(ev['missing']).replace('_',' ')) + '?'
     elif category == 'NEGOTIATE': content = f"The asking price appears higher than our preliminary buying range. Would the seller consider an offer closer to ${ev['metrics']['mao']:,.0f}?" if ev['metrics']['mao'] is not None and ev['metrics']['mao'] > 0 else 'Could you share whether the seller has flexibility on price?'
     elif category == 'REJECT': content = 'The property does not appear to fit our criteria at the proposed terms. Please keep us in mind for future opportunities.'
     else: content = 'The property appears potentially aligned with our criteria. Please share photographs, condition details, supporting documentation, availability and closing terms.'
@@ -35,6 +36,6 @@ def draft(p, ev, sender, subject):
     if len(calls) != 1 or json.loads(calls[0].arguments) != {}:
         raise ValueError('Invalid drafting tool call')
     final = client.responses.create(model=os.getenv('OPENAI_MODEL','gpt-4.1-mini'),instructions=instructions,previous_response_id=response.id,input=[{'type':'function_call_output','call_id':calls[0].call_id,'output':json.dumps(ev['missing'])}])
-    return {**fallback, 'body':validate_reply(final.output_text, context)}
+    return {**fallback, 'body':expand_financial_terms(validate_reply(final.output_text, context))}
 
 

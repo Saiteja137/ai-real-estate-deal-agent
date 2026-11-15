@@ -3,9 +3,9 @@
 This application evaluates incoming wholesale property emails, presents a draft to a human, and uses an email decision before sending a response. Approved replies may be rewritten to include an approver comment; rejected replies send a polite decline. FastAPI serves a React dashboard; LangGraph coordinates extraction and evaluation. Deterministic Python calculations use Decimal; classification uses either Python rules or a LangChain OpenAI assessment depending on AI_ENABLED. SMTP and IMAP are optional and disabled by default. Real provider integration has not been verified; tests mock external services.
 
 1. **Why Decimal?** It avoids binary floating-point arithmetic during monetary calculations.
-2. **What is MAO?** ARV multiplied by the configured ratio, less estimated repairs.
+2. **What is MAO (Maximum Allowable Offer)?** ARV (After Repair Value) multiplied by the configured ratio, less estimated repairs.
 3. **What is gross spread?** ARV less asking price and repairs, before other costs.
-4. **When is ROI unavailable?** When required costs are missing or the all-in cost is zero.
+4. **When is ROI (Return on Investment) unavailable?** When required costs are missing or the all-in cost is zero.
 5. **Why preliminary?** Seller estimates have not been independently verified.
 6. **Who classifies?** Python rules when AI is off; a LangChain OpenAI assessment when AI is on, without running the Python classification rules.
 7. **How is missing information handled?** Null values remain unknown.
