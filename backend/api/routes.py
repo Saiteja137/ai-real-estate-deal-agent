@@ -14,6 +14,7 @@ from backend.database import audit, row, unpack
 from backend.services import approval_service
 from backend.services.approval_notification import build_notification
 from backend import config
+from backend.agents.reflection_agent import ReflectionError
 class EmailInput(BaseModel):
     sender: str = Field(min_length=3,max_length=320)
     subject: str = Field(min_length=1,max_length=500)
@@ -53,6 +54,8 @@ def set_criteria(v: Criteria):
 def analyze_email(subject, body, sender, criteria):
     try:
         return run_workflow(subject,body,sender,criteria)
+    except ReflectionError as exc:
+        raise HTTPException(502,'The AI quality review could not validate the analysis or draft. Please review the email and try again.') from exc
     except openai.AuthenticationError as exc:
         raise HTTPException(502,'OpenAI authentication failed. Check OPENAI_API_KEY in .env and restart the backend.') from exc
     except (openai.PermissionDeniedError, openai.NotFoundError) as exc:
@@ -81,6 +84,8 @@ def process_email(e: EmailInput):
         for item in result['results']:
             p=item['property']; ev=item['evaluation']; d=item['draft']; did=str(uuid.uuid4())
             c.execute('INSERT INTO deals VALUES (?,?,?,?,?,?,?)',(did,eid,json.dumps(p),json.dumps(ev),json.dumps(d),source,stamp(now())))
+            if ev.get('ai_review',{}).get('status')=='passed':
+                audit(c,'ai_review_passed',{'deal_id':did,'stages':ev['ai_review']['stages']})
             ids.append(did)
         audit(c,'email_processed',{'email_id':eid,'deal_ids':ids,'extraction':source})
         for did in ids: audit(c,'deal_evaluated',{'deal_id':did})
@@ -103,6 +108,8 @@ def reanalyze_deal(deal_id: str):
         for item in result['results']:
             did=str(uuid.uuid4())
             c.execute('INSERT INTO deals VALUES (?,?,?,?,?,?,?)',(did,previous['email_id'],json.dumps(item['property']),json.dumps(item['evaluation']),json.dumps(item['draft']),result['source'],stamp(now())))
+            if item['evaluation'].get('ai_review',{}).get('status')=='passed':
+                audit(c,'ai_review_passed',{'deal_id':did,'stages':item['evaluation']['ai_review']['stages']})
             audit(c,'deal_reanalyzed',{'deal_id':did,'previous_deal_id':deal_id})
             ids.append(did)
     return {'deal_ids':ids}

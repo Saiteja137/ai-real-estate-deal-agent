@@ -117,8 +117,10 @@ def test_duplicate_input_and_overview():
 def test_openai_drafting_function_call_is_validated(monkeypatch):
     import types, openai
     from backend import config
+    from backend.agents import email_agent
     from backend.core import draft
     calls=[]
+    reviews=[]
     class Responses:
         def create(self, **kwargs):
             calls.append(kwargs)
@@ -128,11 +130,13 @@ def test_openai_drafting_function_call_is_validated(monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY','fake-test-key')
     monkeypatch.setattr(config,'AI_ENABLED',True)
     monkeypatch.setattr(openai,'OpenAI',lambda:types.SimpleNamespace(responses=Responses()))
+    monkeypatch.setattr(email_agent,'review_ai_output',lambda *args:reviews.append(args))
     result=draft({}, {'classification':'INSUFFICIENT_DATA','missing':['arv'],'metrics':{}},'seller@example.com','Offer')
     assert result['recipient']=='seller@example.com'
     assert result['body']=='Thank you. Please share the missing information.'
     assert calls[0]['tools'][0]['name']=='get_missing_information'
     assert calls[1]['input'][0]['output']=='["arv"]'
+    assert reviews[0][0]=='draft' and reviews[0][2]==result['body']
 
 def test_live_approved_reply_smtp_once(monkeypatch):
     from backend import config
@@ -156,6 +160,25 @@ def test_smtp_uncertainty_is_not_retried(monkeypatch):
     result=approval_service.process_reply(a['id'],'approver@example.com',f"Approval ID: {a['id']}\nDecision: APPROVED",datetime.now(timezone.utc))
     assert result['execution']=='NEEDS_RECONCILIATION'
     assert client.get('/api/deals/'+did).json()['approvals'][0]['execution']['status']=='NEEDS_RECONCILIATION'
+
+def test_definite_wholesaler_send_failure_is_recorded(monkeypatch):
+    from backend.services import approval_service, email_service
+    did,a=approval()
+    def fail(*args, **kwargs): raise email_service.EmailNotSent('not accepted')
+    monkeypatch.setattr(approval_service.email_service,'send_message',fail)
+    assert reply(a).json()['execution']=='SEND_FAILED'
+    assert client.get('/api/deals/'+did).json()['current_status']=='SEND_FAILED'
+
+def test_definite_approval_notification_failure_is_recorded(monkeypatch):
+    from backend.services import approval_service, email_service
+    did=create()
+    def fail(*args, **kwargs): raise email_service.EmailNotSent('not accepted')
+    monkeypatch.setattr(approval_service.email_service,'send_message',fail)
+    response=client.post(f'/api/deals/{did}/approvals')
+    assert response.status_code==502
+    state=client.get('/api/deals/'+did).json()
+    assert state['current_status']=='NOTIFICATION_FAILED'
+    assert any(event['event']=='notification_failed' for event in state['activity'])
 
 def test_timely_received_processed_after_deadline():
     from backend.services.approval_service import process_reply
@@ -345,12 +368,124 @@ def test_langchain_ai_evaluation_uses_precomputed_metrics(monkeypatch):
             received['messages']=messages
             return {'classification':'NEGOTIATE','explanation':'Price requires review.','financial_assessment':'Review the calculated maximum offer.','criteria_assessment':'Compare the offer with the buying criteria.','due_diligence':['Verify repair estimates.'],'strengths':['Location stated'],'risks':['Verify repairs'],'passed':['Minimum ARV'],'failed':[],'recommended_action':'NEGOTIATE','suggested_next_action':'Request more details.'}
     monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
+    reviews=[]
+    monkeypatch.setattr(evaluation_agent,'review_ai_output',lambda *args:reviews.append(args))
     rule={'classification':'POTENTIAL_MATCH','metrics':{'mao':119000},'criteria':{},'missing':[]}
     result=evaluation_agent.assess_property({'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000},rule)
     assert result['classification']=='NEGOTIATE'
     assert received['config']['use_responses_api'] is True
     assert received['method']=='json_schema'
     assert '119000' in received['messages'][1].content
+    assert reviews[0][0]=='evaluation' and reviews[0][2]==result
+
+def test_ai_extraction_and_followup_are_reviewed(monkeypatch):
+    import types, openai
+    from backend import config
+    from backend.agents import property_agent, email_agent
+    from backend.schemas.property import Properties, Property
+    reviews=[]
+    responses=types.SimpleNamespace(
+        parse=lambda **kwargs:types.SimpleNamespace(output_parsed=Properties(properties=[Property(city='Dallas')])),
+        create=lambda **kwargs:types.SimpleNamespace(output_text='Thank you. Please share photos.'),
+    )
+    monkeypatch.setattr(config,'AI_ENABLED',True)
+    monkeypatch.setattr(openai,'OpenAI',lambda:types.SimpleNamespace(responses=responses))
+    monkeypatch.setattr(property_agent,'review_ai_output',lambda *args:reviews.append(args))
+    monkeypatch.setattr(email_agent,'review_ai_output',lambda *args:reviews.append(args))
+    properties,_=property_agent.extract('Offer','Location: Dallas')
+    body,_=email_agent.polish_followup('Thank you.','Please share photos.','APPROVED')
+    assert reviews[0][0]=='extraction' and reviews[0][2]==properties
+    assert reviews[1][0]=='followup' and reviews[1][2]==body
+
+def test_reflection_agent_checks_each_stage_and_fails_closed(monkeypatch):
+    import json
+    from backend.agents import reflection_agent
+    seen=[]
+    class FakeModel:
+        verdict='PASS'
+        def __init__(self,**kwargs): pass
+        def with_structured_output(self,schema,method):
+            assert schema is reflection_agent.ReflectionResult and method=='json_schema'
+            return self
+        def invoke(self,messages):
+            seen.append(json.loads(messages[1].content))
+            return {'verdict':self.verdict,'issues':[] if self.verdict=='PASS' else ['Unsupported claim']}
+    monkeypatch.setattr(reflection_agent,'ChatOpenAI',FakeModel)
+    for stage in ('extraction','evaluation','draft','followup'):
+        reflection_agent.review_ai_output(stage,{'source':'facts'},'candidate')
+    assert [item['stage'] for item in seen]==['extraction','evaluation','draft','followup']
+    FakeModel.verdict='FAIL'
+    with pytest.raises(reflection_agent.ReflectionError):
+        reflection_agent.review_ai_output('draft',{'source':'facts'},'candidate')
+
+def test_ai_retries_regenerate_and_review_then_return_success(monkeypatch):
+    import types, openai
+    from backend import config
+    from backend.agents import email_agent
+    from backend.agents.reflection_agent import ReflectionError
+    calls=[]; reviews=[]
+    class Responses:
+        def create(self,**kwargs):
+            calls.append(kwargs)
+            if 'tools' in kwargs:
+                return types.SimpleNamespace(id='response',output=[types.SimpleNamespace(type='function_call',name='get_missing_information',arguments='{}',call_id='call')])
+            return types.SimpleNamespace(output_text='Please share the missing information.')
+    def review(*args):
+        reviews.append(args)
+        if len(reviews)<3: raise ReflectionError('failed review')
+    monkeypatch.setattr(config,'AI_ENABLED',True)
+    monkeypatch.setattr(openai,'OpenAI',lambda:types.SimpleNamespace(responses=Responses()))
+    monkeypatch.setattr(email_agent,'review_ai_output',review)
+    result=email_agent.draft({}, {'classification':'INSUFFICIENT_DATA','missing':['arv'],'metrics':{}},'seller@example.com','Offer')
+    assert len(reviews)==3 and len(calls)==6
+    assert 'previous response failed' in calls[2]['instructions']
+    assert result['body']=='Please share the missing information.'
+
+def test_ai_retry_limit_holds_unreviewed_followup(monkeypatch):
+    import types, openai
+    from backend import config
+    from backend.agents import email_agent
+    from backend.agents.reflection_agent import ReflectionError
+    from backend.services import approval_service
+    generated=[]; sent=[]
+    did,a=approval()
+    monkeypatch.setattr(config,'AI_ENABLED',True)
+    monkeypatch.setattr(openai,'OpenAI',lambda:types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **kwargs:generated.append(kwargs) or types.SimpleNamespace(output_text='Please share photos.'))))
+    def reject(*args): raise ReflectionError('failed review')
+    monkeypatch.setattr(email_agent,'review_ai_output',reject)
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs:sent.append(args) or 'SMTP_ACCEPTED')
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: Please share photos")
+    assert len(generated)==4
+    assert result.json()['execution']=='REQUIRES_REVIEW' and sent==[]
+    assert client.get('/api/deals/'+did).json()['current_status']=='REQUIRES_REVIEW'
+
+def test_reflection_failure_blocks_sending_followup(monkeypatch):
+    from backend.agents.reflection_agent import ReflectionError
+    from backend.services import approval_service
+    sent=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    did,a=approval()
+    def fail(*args): raise ReflectionError('review failed')
+    monkeypatch.setattr(approval_service,'polish_followup',fail)
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: Please share photos")
+    assert result.json()['execution']=='REQUIRES_REVIEW'
+    assert len(sent)==1
+    state=client.get('/api/deals/'+did).json()
+    assert state['current_status']=='REQUIRES_REVIEW'
+    assert any(event['event']=='reply_requires_review' for event in state['activity'])
+
+def test_reflection_unavailable_blocks_ai_analysis(monkeypatch):
+    from backend.agents import reflection_agent
+    from backend.api import routes
+    class BrokenModel:
+        def __init__(self,**kwargs): raise RuntimeError('provider unavailable')
+    monkeypatch.setattr(reflection_agent,'ChatOpenAI',BrokenModel)
+    def workflow(*args): reflection_agent.review_ai_output('extraction',{}, {})
+    monkeypatch.setattr(routes,'run_workflow',workflow)
+    response=client.post('/api/emails',json={'sender':'seller@example.com','subject':'Offer','body':'Property offer'})
+    assert response.status_code==502 and 'quality review' in response.json()['detail']
+    with db() as c:
+        assert c.execute('SELECT count(*) FROM deals').fetchone()[0]==0
 
 def test_graph_uses_ai_classification_but_keeps_python_metrics(monkeypatch):
     from backend import config

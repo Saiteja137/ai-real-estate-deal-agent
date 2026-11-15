@@ -16,6 +16,25 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 
 Open http://127.0.0.1:8000. Set `AI_ENABLED=true`, `OPENAI_API_KEY`, and `OPENAI_MODEL` in `.env` to enable OpenAI extraction, LangChain AI evaluation, drafting and comment polishing. `AI_ENABLED=false` uses the limited local parser, deterministic rule classification and template replies even if a key exists. Restart the backend after changes. AI mode requires a key and reports an error when it is missing. Run `python -m pytest -q` for mocked tests. Sample emails are fictional.
 
+When AI is enabled, a separate reflection agent reviews the extracted facts, buyer assessment, original draft, and any AI-polished approval reply against their available source information. Failed or unavailable reviews stop the analysis, or hold a final reply for manual review. The activity timeline records completed reviews; edits made afterward are not covered by the original review. This adds model calls, time, and API cost. The review is another AI judgment, not proof of accuracy or verification of the seller's claims; the buyer must still review the deal.
+
+If an AI response fails validation or reflection, the application regenerates and reviews it up to three times (four attempts total). After the final failure it stops the analysis or holds the reply for review. Provider-level retries for connection errors are separate.
+
+## Continuous integration
+
+GitHub Actions runs the checks in `.github/workflows/ci.yml` on every push and pull request, and can also be started from the Actions tab. The backend job checks Python syntax, lints for errors and runs the test suite. The frontend job installs the locked dependencies, runs ESLint, checks TypeScript and builds the application. It does not deploy anything.
+
+The tests use a temporary SQLite database and mock external services, so CI needs no `.env`, Gmail password or OpenAI API key. These checks do not verify live email or AI provider connections. To run the checks locally, install the project dependencies and `ruff==0.12.12`, then run:
+
+```sh
+python -m compileall -q backend tests
+ruff check --select E9,F63,F7,F82 backend tests
+python -m pytest -q
+npm ci --prefix frontend
+npm run lint --prefix frontend
+npm run build --prefix frontend
+```
+
 ## Email setup
 
 Set `HITL_EMAIL_ENABLED=true` and configure SMTP, IMAP, `APPROVER_EMAILS`, and `APPROVAL_REPLY_TO` to send approval requests, monitor replies, and send the frozen response after valid approval. The reply-to address must deliver into `IMAP_FOLDER`. With `HITL_EMAIL_ENABLED=false`, deals and drafts are displayed for review without approval requests or outbound sending. Changing the switch requires a backend restart. Historical approvals and recorded executions remain visible. SMTP uses STARTTLS; IMAP uses TLS. Restart after changing `.env`. Never share credentials or commit `.env`.
@@ -24,7 +43,7 @@ Set `HITL_EMAIL_ENABLED=true` and configure SMTP, IMAP, `APPROVER_EMAILS`, and `
 
 To ingest incoming offers automatically, set `LIVE_EMAIL_INGESTION_ENABLED=true` and configure IMAP. `INGESTION_IMAP_FOLDER` chooses the source folder (default `INBOX`); it can be different from the approval folder. The independent `LIVE_EMAIL_INGESTION_ENABLED` option controls only automatic offer ingestion; it is not needed for manual input or email approvals. The worker scans messages, deduplicates by mailbox UID, and applies a simple property-and-price keyword filter before processing. This filter may miss offers or include unrelated messages; review all results. Automatic ingestion never approves or sends replies.
 
-Successful SMTP acceptance does not guarantee delivery. A send failure or timeout is recorded as `NEEDS_RECONCILIATION` and is not automatically retried. A process interruption can leave `SENDING`, which also requires reconciliation. IMAP uses server INTERNALDATE and scans before expiring requests; scan errors defer expiration. Run one application process and use a trustworthy mailbox clock.
+Successful SMTP acceptance does not guarantee delivery. Transient connection failures before submission and explicit temporary SMTP rejections are retried up to three times, with delays of 1, 2 and 4 seconds. A definite failure after retries is recorded as `SEND_FAILED` for a wholesaler reply or `NOTIFICATION_FAILED` for an approval request. A disconnect or timeout during submission may mean the server accepted the message, so it is recorded as `NEEDS_RECONCILIATION` or `NOTIFICATION_UNKNOWN` and is not retried. A process interruption can leave `SENDING`, which also requires reconciliation. IMAP uses server INTERNALDATE and scans before expiring requests; scan errors defer expiration. Run one application process and use a trustworthy mailbox clock.
 
 **Security:** The local API has no login. Bind to localhost and do not expose it to an untrusted network. Sender addresses can be forged; the 128-bit approval ID acts as a confidential capability, but is not cryptographic proof of sender identity. Protect the mailbox, dashboard, database and logs. The real provider integrations have only been tested with mocks, not independently security-reviewed.
 

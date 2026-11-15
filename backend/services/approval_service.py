@@ -12,6 +12,7 @@ from backend.services import email_service
 from backend.services.approval_notification import build_notification, notification_html
 from backend.agents.email_agent import polish_followup
 from backend.agents.guardrails import validate_reply
+from backend.agents.reflection_agent import ReflectionError
 
 
 
@@ -52,6 +53,11 @@ def create_approval(deal_id: str, *, followup_of=None, prepared_payload=None):
 
         email_service.send_message(os.environ['APPROVER_EMAILS'],f'[APPROVAL REQUIRED] Real Estate Deal – ID: {a}',notification,reply_to=os.environ['APPROVAL_REPLY_TO'],html_body=notification_html(notification,approval_id=a,reply_to=os.environ['APPROVAL_REPLY_TO'],is_second_review=followup_of is not None))
 
+    except email_service.EmailNotSent as exc:
+        with db() as c:
+            c.execute("UPDATE approvals SET status='NOTIFICATION_FAILED' WHERE id=?",(a,))
+            audit(c,'notification_failed',{'approval_id':a})
+        raise HTTPException(502,'Approval notification was not sent after SMTP retries. Check the email settings and try again.') from exc
     except Exception as exc:
 
         with db() as c:
@@ -153,6 +159,11 @@ def process_reply(approval_id, sender, text, received):
     if not is_followup and (comment or status=='REJECTED'):
         try:
             final_payload['body'], source = polish_followup(final_payload['body'], comment, status)
+        except ReflectionError:
+            with db() as c:
+                c.execute("UPDATE executions SET status='REQUIRES_REVIEW',payload=? WHERE approval_id=? AND status IN ('PREPARING','PREPARING_REVIEW')",(json.dumps(final_payload),approval_id))
+                audit(c,'reply_requires_review',{'approval_id':approval_id,'deal_id':a['deal_id'],'recipient':final_payload['recipient'],'reason':'AI quality review could not validate the reply'})
+            return {'status':status,'execution':'REQUIRES_REVIEW'}
         except Exception:
             # Keep the drafted reply and the note when AI is unavailable.
             source='template_after_ai_error'
@@ -184,9 +195,13 @@ def process_reply(approval_id, sender, text, received):
         updated=c.execute("UPDATE executions SET payload=?,status='SENDING' WHERE approval_id=? AND status='PREPARING'",(json.dumps(final_payload),approval_id))
         if updated.rowcount != 1: raise RuntimeError('Execution reservation unavailable')
         audit(c,'final_reply_prepared',{'deal_id':a['deal_id'],'approval_id':approval_id,'source':source,'decision':status,'recipient':final_payload['recipient']})
+        if source == 'openai':
+            audit(c,'ai_reply_review_passed',{'deal_id':a['deal_id'],'approval_id':approval_id})
         audit(c,'wholesaler_send_started',{'deal_id':a['deal_id'],'approval_id':approval_id,'recipient':final_payload['recipient']})
     try:
         result=email_service.send_message(final_payload['recipient'],final_payload['subject'],final_payload['body'])
+    except email_service.EmailNotSent:
+        result='SEND_FAILED'
     except Exception:
         result='NEEDS_RECONCILIATION'
     with db() as c:

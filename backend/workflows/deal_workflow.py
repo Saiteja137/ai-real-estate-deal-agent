@@ -37,7 +37,10 @@ def run_workflow(subject, body, sender, criteria):
                 ev['criteria_results']=criteria_checks(p,s['criteria'],ev['metrics'])
                 ev['evaluation_source']='python_rules'
             ev['initial_draft_source']='openai' if config.AI_ENABLED else 'template'
-            results.append({'property':p,'evaluation':ev,'draft':draft(p,ev,s['sender'],s['subject'])})
+            proposed=draft(p,ev,s['sender'],s['subject'])
+            if config.AI_ENABLED:
+                ev['ai_review']={'status':'passed','stages':['extraction','evaluation','draft']}
+            results.append({'property':p,'evaluation':ev,'draft':proposed})
         return {'results':results}
     graph=StateGraph(State)
     graph.add_node('extract',extraction_node); graph.add_node('evaluate_and_draft',evaluation_node)
