@@ -11,10 +11,13 @@ from backend import config
 from backend.database import db, now, stamp, payload_hash, audit, row, unpack
 
 from backend.services import email_service
+from backend.services.approval_notification import build_notification
+from backend.agents.email_agent import polish_followup
+from backend.agents.guardrails import validate_reply
 
 
 
-def create_approval(deal_id: str):
+def create_approval(deal_id: str, *, followup_of=None, prepared_payload=None):
 
     if not config.HITL_EMAIL_ENABLED: raise HTTPException(409,'Email approvals are disabled')
 
@@ -26,11 +29,25 @@ def create_approval(deal_id: str):
 
         if c.execute("SELECT 1 FROM approvals WHERE deal_id=? AND status='PENDING'",(deal_id,)).fetchone(): raise HTTPException(409,'An approval is already pending')
 
+        if followup_of is not None:
+            parent=row(c,'approvals',followup_of)
+            if parent['deal_id'] != deal_id or prepared_payload is None:
+                raise HTTPException(409,'Invalid follow-up approval')
+            if payload_hash(d['draft']) != parent['payload_hash']:
+                raise HTTPException(409,'The draft changed while the follow-up was being prepared')
+            changed=c.execute("UPDATE executions SET status='AWAITING_SECOND_APPROVAL',payload=? WHERE approval_id=? AND status='PREPARING_REVIEW'",(json.dumps(prepared_payload),followup_of))
+            if changed.rowcount != 1: raise HTTPException(409,'Follow-up is no longer available')
+            c.execute('UPDATE deals SET draft=? WHERE id=?',(json.dumps(prepared_payload),deal_id))
+            d['draft']=prepared_payload
         a='RE-'+uuid.uuid4().hex.upper(); created=now(); deadline=created+timedelta(minutes=config.APPROVAL_TIMEOUT_MINUTES); p=d['property']; ev=d['evaluation']; v=d['draft']
 
-        notification=f"APPROVAL NOTIFICATION\nApproval ID: {a}\nDeadline: {stamp(deadline)}\nProperty: {p.get('address') or p.get('city') or 'Unknown'}\nWholesaler: {v['recipient']}\nAsking price: {p.get('asking_price')}\nARV: {p.get('arv')}\nRepairs: {p.get('repairs')}\nMAO: {ev['metrics']['mao']}\nGross spread: {ev['metrics']['gross_spread']}\nClassification: {ev['classification']}\nRisks: {'; '.join(ev['risks'])}\n\nPROPOSED RESPONSE\nTo: {v['recipient']}\nSubject: {v['subject']}\n\n{v['body']}\n\nReply with the following two lines:\nApproval ID: {a}\nDecision: APPROVED\n\nOr use Decision: REJECTED. No response means no email will be sent. Keep the approval ID confidential."
-
+        notification=build_notification(a,stamp(deadline),p,ev,v,
+            is_second_review=followup_of is not None,
+            second_review_enabled=config.SECOND_DRAFT_APPROVAL_ENABLED)
         c.execute('INSERT INTO approvals(id,deal_id,payload,payload_hash,status,created_at,deadline,notification) VALUES (?,?,?,?,?,?,?,?)',(a,deal_id,json.dumps(v),payload_hash(v),'PENDING',stamp(created),stamp(deadline),notification)); audit(c,'approval_requested',{'approval_id':a})
+        if followup_of is not None:
+            c.execute('INSERT INTO approval_followups(approval_id,parent_approval_id) VALUES (?,?)',(a,followup_of))
+            audit(c,'second_approval_requested',{'approval_id':a,'parent_approval_id':followup_of,'deal_id':deal_id})
 
     try:
 
@@ -98,31 +115,83 @@ def process_reply(approval_id, sender, text, received):
 
         if payload_hash(payload)!=a['payload_hash']: raise HTTPException(409,'Frozen payload integrity check failed')
 
-        comment=re.search(r'(?im)^Comments:\s*(.*)$',clean)
+        comments=re.findall(r'(?im)^[ \t]*Comments?[ \t]*:[ \t]*([^\r\n]*)',clean)
+        if len(comments)>1: raise HTTPException(400,'Ambiguous comments')
+        comment=comments[0].strip() if comments else ''
+        if len(comment)>2000: raise HTTPException(400,'Comment is too long')
+        is_followup = c.execute('SELECT 1 FROM approval_followups WHERE approval_id=?',(approval_id,)).fetchone() is not None
+        if is_followup and comment: raise HTTPException(400,'Do not add a comment to a second decision; reject if changes are required')
 
-        c.execute('UPDATE approvals SET status=?,decided_at=?,sender=?,comments=? WHERE id=?',(status,stamp(received),sender,comment.group(1) if comment else None,approval_id))
+        c.execute('UPDATE approvals SET status=?,decided_at=?,sender=?,comments=? WHERE id=?',(status,stamp(received),sender,comment or None,approval_id))
 
-        execution=None
+        if is_followup and status=='REJECTED':
+            audit(c,'approval_decision',{'approval_id':approval_id,'status':status,'execution':None,'sender':sender,'comment':None})
+            return {'status':status,'execution':None}
 
-        if status=='APPROVED':
+        # Reserve the unique execution before any external calls. This prevents
+        # duplicate decisions from sending twice, including after a restart.
+        needs_second_review = not is_followup and config.SECOND_DRAFT_APPROVAL_ENABLED and (status=='REJECTED' or bool(comment))
+        execution='PREPARING_REVIEW' if needs_second_review else 'SENDING'
+        c.execute('INSERT INTO executions VALUES (?,?,?,?,?)',(str(uuid.uuid4()),approval_id,execution,a['payload'],stamp(now())))
+        audit(c,'approval_decision',{'approval_id':approval_id,'status':status,'execution':execution,'sender':sender,'comment':comment or None})
 
-            execution='SENDING'
-
-            c.execute('INSERT INTO executions VALUES (?,?,?,?,?)',(str(uuid.uuid4()),approval_id,execution,a['payload'],stamp(now())))
-
-        audit(c,'approval_decision',{'approval_id':approval_id,'status':status,'execution':execution})
-
-    if execution=='SENDING':
-
-        try: result=email_service.send_message(payload['recipient'],payload['subject'],payload['body'])
-
-        except Exception: result='NEEDS_RECONCILIATION'
-
+    final_payload = dict(payload)
+    if status == 'REJECTED' and not is_followup:
         with db() as c:
-
-            c.execute('UPDATE executions SET status=?,executed_at=? WHERE approval_id=?',(result,stamp(now()),approval_id)); audit(c,'email_execution',{'approval_id':approval_id,'status':result})
-
-        execution=result
+            deal = row(c, 'deals', a['deal_id'])
+        property_details = json.loads(deal['property'])
+        name = property_details.get('wholesaler_name') or 'there'
+        signature = '\n'.join(part for part in (os.getenv('BUYER_NAME', 'Example Buyer'), os.getenv('BUYER_COMPANY', '')) if part)
+        final_payload['body'] = (f'Hi {name},\n\nThank you for sharing this opportunity.\n\n'
+            'After reviewing the available information, we will not be moving forward '
+            'with this property at this time. Please keep us in mind for future opportunities.\n\n'
+            f'Best regards,\n{signature}')
+    if comment:
+        final_payload['body'] += f'\n\nAdditional note: {comment}'
+    template_body = final_payload['body']
+    source='original' if status=='APPROVED' and not comment else 'template'
+    if not is_followup and (comment or status=='REJECTED'):
+        try:
+            final_payload['body'], source = polish_followup(final_payload['body'], comment, status)
+        except Exception:
+            # Keep the drafted reply and the note when AI is unavailable.
+            source='template_after_ai_error'
+        try:
+            validate_reply(final_payload['body'], {'approved_draft':payload['body'],'comment':comment,'template':template_body})
+        except ValueError:
+            final_payload['body'] = template_body
+            source = 'template_after_guardrail'
+            try:
+                validate_reply(template_body, {'approved_draft':payload['body'],'comment':comment,'template':template_body})
+            except ValueError:
+                with db() as c:
+                    c.execute("UPDATE executions SET status='REQUIRES_REVIEW',payload=? WHERE approval_id=? AND status IN ('SENDING','PREPARING_REVIEW')",(json.dumps(final_payload),approval_id))
+                    audit(c,'reply_requires_review',{'approval_id':approval_id,'deal_id':a['deal_id']})
+                return {'status':status,'execution':'REQUIRES_REVIEW'}
+    if needs_second_review:
+        try:
+            followup = create_approval(a['deal_id'],followup_of=approval_id,prepared_payload=final_payload)
+        except Exception:
+            with db() as c:
+                c.execute("UPDATE executions SET status='SECOND_APPROVAL_ERROR' WHERE approval_id=? AND status IN ('PREPARING_REVIEW','AWAITING_SECOND_APPROVAL')",(approval_id,))
+                audit(c,'second_approval_error',{'approval_id':approval_id,'deal_id':a['deal_id']})
+            return {'status':status,'execution':'SECOND_APPROVAL_ERROR'}
+        return {'status':status,'execution':'AWAITING_SECOND_APPROVAL','followup_approval_id':followup['id']}
+    # Persist the exact message before sending. The approval's frozen original
+    # remains untouched; execution.payload records what was actually attempted.
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        updated=c.execute("UPDATE executions SET payload=? WHERE approval_id=? AND status='SENDING'",(json.dumps(final_payload),approval_id))
+        if updated.rowcount != 1: raise RuntimeError('Execution reservation unavailable')
+        audit(c,'final_reply_prepared',{'deal_id':a['deal_id'],'approval_id':approval_id,'source':source,'decision':status})
+    try:
+        result=email_service.send_message(final_payload['recipient'],final_payload['subject'],final_payload['body'])
+    except Exception:
+        result='NEEDS_RECONCILIATION'
+    with db() as c:
+        c.execute('UPDATE executions SET status=?,executed_at=? WHERE approval_id=?',(result,stamp(now()),approval_id))
+        audit(c,'email_execution',{'approval_id':approval_id,'status':result})
+    execution=result
 
     return {'status':status,'execution':execution}
 

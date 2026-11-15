@@ -31,6 +31,7 @@ def init():
         CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, approval_id TEXT UNIQUE NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, executed_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, event TEXT NOT NULL, details TEXT NOT NULL);''')
         c.execute('CREATE TABLE IF NOT EXISTS mailbox_messages (id TEXT PRIMARY KEY, received_at TEXT NOT NULL, result TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS approval_followups (approval_id TEXT PRIMARY KEY, parent_approval_id TEXT UNIQUE NOT NULL)')
         c.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',('criteria',json.dumps(DEFAULT_CRITERIA)))
 init()
 

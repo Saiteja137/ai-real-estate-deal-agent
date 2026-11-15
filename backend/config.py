@@ -7,6 +7,10 @@ def flag(name, default=False):
     return value == 'true'
 HITL_EMAIL_ENABLED=flag('HITL_EMAIL_ENABLED')
 LIVE_EMAIL_INGESTION_ENABLED=flag('LIVE_EMAIL_INGESTION_ENABLED')
+AI_ENABLED=flag('AI_ENABLED')
+SECOND_DRAFT_APPROVAL_ENABLED=flag('SECOND_DRAFT_APPROVAL_ENABLED',True)
+if AI_ENABLED and not os.getenv('OPENAI_API_KEY','').strip():
+    raise RuntimeError('AI_ENABLED=true requires OPENAI_API_KEY')
 if HITL_EMAIL_ENABLED:
     needed=['SMTP_HOST','SMTP_USERNAME','SMTP_PASSWORD','SMTP_FROM','IMAP_HOST','IMAP_USERNAME','IMAP_PASSWORD','APPROVER_EMAILS','APPROVAL_REPLY_TO']
     missing=[k for k in needed if not os.getenv(k)]

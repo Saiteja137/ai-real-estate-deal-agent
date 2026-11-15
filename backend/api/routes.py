@@ -6,11 +6,8 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from email import policy
-from email.parser import BytesParser
-from email.utils import parseaddr
-from html.parser import HTMLParser
 from pydantic import BaseModel, Field
+import openai
 from backend.core import DEFAULT_CRITERIA, run_workflow
 
 from backend.database import db, init, now, stamp, payload_hash
@@ -48,7 +45,7 @@ def index():
 def samples(): return json.loads(Path('data/sample_emails.json').read_text(encoding='utf-8'))
 @app.get('/api/config')
 def public_config():
-    return {'hitl_email_enabled': config.HITL_EMAIL_ENABLED, 'live_email_ingestion_enabled': config.LIVE_EMAIL_INGESTION_ENABLED}
+    return {'hitl_email_enabled': config.HITL_EMAIL_ENABLED, 'live_email_ingestion_enabled': config.LIVE_EMAIL_INGESTION_ENABLED, 'ai_enabled': config.AI_ENABLED, 'second_draft_approval_enabled':config.SECOND_DRAFT_APPROVAL_ENABLED}
 @app.get('/api/criteria')
 def get_criteria():
     with db() as c: return json.loads(c.execute("SELECT value FROM settings WHERE key='criteria'").fetchone()[0])
@@ -58,22 +55,35 @@ def set_criteria(v: Criteria):
         c.execute("UPDATE settings SET value=? WHERE key='criteria'",(v.model_dump_json(),))
         audit(c,'criteria_updated',v.model_dump())
     return v
+
+def analyze_email(subject, body, sender, criteria):
+    try:
+        return run_workflow(subject,body,sender,criteria)
+    except openai.AuthenticationError as exc:
+        raise HTTPException(502,'OpenAI authentication failed. Check OPENAI_API_KEY in .env and restart the backend.') from exc
+    except (openai.PermissionDeniedError, openai.NotFoundError) as exc:
+        raise HTTPException(502,'The configured OpenAI model is unavailable to this project. Check OPENAI_MODEL and the project model permissions, then restart the backend.') from exc
+    except openai.RateLimitError as exc:
+        raise HTTPException(502,'OpenAI rate limit or quota was reached. Check API usage and billing, then try again.') from exc
+    except (openai.APIConnectionError, openai.APITimeoutError) as exc:
+        raise HTTPException(502,'Could not reach OpenAI. Check the internet connection and try again.') from exc
+    except Exception as exc:
+        raise HTTPException(502,'Property analysis or drafting failed. Check the server configuration and try again.') from exc
+
 @app.post('/api/emails')
 def process_email(e: EmailInput):
     if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',e.sender): raise HTTPException(422,'Invalid sender')
     fp=payload_hash(e.model_dump())
     with db() as c:
-        if c.execute('SELECT 1 FROM emails WHERE fingerprint=?',(fp,)).fetchone(): raise HTTPException(409,'Email already processed')
+        if c.execute('SELECT 1 FROM emails WHERE fingerprint=?',(fp,)).fetchone(): raise HTTPException(409,'This email has already been processed. Select the existing deal in the dashboard.')
     criteria=get_criteria()
-    try:
-        result = run_workflow(e.subject,e.body,e.sender,criteria)
-        properties, source = result['properties'], result['source']
-    except Exception as exc: raise HTTPException(502,'Extraction failed; check OpenAI configuration and logs') from exc
+    result = analyze_email(e.subject,e.body,e.sender,criteria)
+    properties, source = result['properties'], result['source']
     if not properties: raise HTTPException(422,'No property found')
     eid=str(uuid.uuid4()); ids=[]
     with db() as c:
         try: c.execute('INSERT INTO emails VALUES (?,?,?,?,?,?)',(eid,e.sender,e.subject,e.body,stamp(now()),fp))
-        except sqlite3.IntegrityError: raise HTTPException(409,'Email already processed')
+        except sqlite3.IntegrityError: raise HTTPException(409,'This email has already been processed. Select the existing deal in the dashboard.')
         for item in result['results']:
             p=item['property']; ev=item['evaluation']; d=item['draft']; did=str(uuid.uuid4())
             c.execute('INSERT INTO deals VALUES (?,?,?,?,?,?,?)',(did,eid,json.dumps(p),json.dumps(ev),json.dumps(d),source,stamp(now())))
@@ -82,33 +92,26 @@ def process_email(e: EmailInput):
         for did in ids: audit(c,'deal_evaluated',{'deal_id':did})
     return {'deal_ids':ids}
 
-class EmlInput(BaseModel):
-    content: str = Field(min_length=1, max_length=500000)
-
-class PlainHTML(HTMLParser):
-    def __init__(self):
-        super().__init__(); self.parts=[]; self.hidden=0
-    def handle_starttag(self, tag, attrs):
-        if tag in ('script','style'): self.hidden+=1
-        if tag in ('p','br','div','li','tr'): self.parts.append('\n')
-    def handle_endtag(self, tag):
-        if tag in ('script','style') and self.hidden: self.hidden-=1
-    def handle_data(self, data):
-        if not self.hidden: self.parts.append(data)
-
-@app.post('/api/import-eml')
-def import_eml(e: EmlInput):
-    message=BytesParser(policy=policy.default).parsebytes(e.content.encode('utf-8'))
-    sender=parseaddr(message.get('From',''))[1]
-    subject=str(message.get('Subject',''))
-    part=message.get_body(preferencelist=('plain','html')) if message.is_multipart() else message
-    if part is None: raise HTTPException(422,'Email has no readable body')
-    try: body=part.get_content()
-    except (LookupError, UnicodeError): raise HTTPException(422,'Email body encoding is invalid')
-    if not isinstance(body,str): raise HTTPException(422,'Email body must be text')
-    if part.get_content_type()=='text/html':
-        parser=PlainHTML(); parser.feed(body); body=''.join(parser.parts)
-    return {'sender':sender,'subject':subject,'body':body.strip()}
+@app.post('/api/deals/{deal_id}/reanalyze')
+def reanalyze_deal(deal_id: str):
+    with db() as c:
+        previous=row(c,'deals',deal_id)
+        incoming=row(c,'emails',previous['email_id'])
+        if c.execute("SELECT 1 FROM approvals a JOIN deals d ON d.id=a.deal_id WHERE d.email_id=? AND a.status='PENDING'",(previous['email_id'],)).fetchone():
+            raise HTTPException(409,'An approval is pending for this email. Resolve it before creating a new analysis.')
+    result=analyze_email(incoming['subject'],incoming['body'],incoming['sender'],get_criteria())
+    if not result['results']: raise HTTPException(422,'No property found')
+    ids=[]
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if c.execute("SELECT 1 FROM approvals a JOIN deals d ON d.id=a.deal_id WHERE d.email_id=? AND a.status='PENDING'",(previous['email_id'],)).fetchone():
+            raise HTTPException(409,'An approval is pending for this email. Resolve it before creating a new analysis.')
+        for item in result['results']:
+            did=str(uuid.uuid4())
+            c.execute('INSERT INTO deals VALUES (?,?,?,?,?,?,?)',(did,previous['email_id'],json.dumps(item['property']),json.dumps(item['evaluation']),json.dumps(item['draft']),result['source'],stamp(now())))
+            audit(c,'deal_reanalyzed',{'deal_id':did,'previous_deal_id':deal_id})
+            ids.append(did)
+    return {'deal_ids':ids}
 
 @app.get('/api/overview')
 def overview():
@@ -128,6 +131,7 @@ def deal_status(c, deal_id):
     a=c.execute('SELECT id,status FROM approvals WHERE deal_id=? ORDER BY created_at DESC LIMIT 1',(deal_id,)).fetchone()
     if not a or a['status']=='INVALIDATED': return 'READY_FOR_REVIEW' if not config.HITL_EMAIL_ENABLED else 'READY_FOR_APPROVAL'
     execution=c.execute('SELECT status FROM executions WHERE approval_id=?',(a['id'],)).fetchone()
+    if a['status']=='APPROVED' and not execution: return 'FOLLOWUP_DRAFT_READY'
     return execution['status'] if execution else a['status']
 @app.get('/api/deals/{deal_id}')
 def deal(deal_id: str):
@@ -136,6 +140,8 @@ def deal(deal_id: str):
         d['approvals']=[dict(r) for r in c.execute('SELECT * FROM approvals WHERE deal_id=? ORDER BY created_at DESC',(deal_id,))]
         for a in d['approvals']:
             a['payload']=json.loads(a['payload']); a['execution']=dict(x) if (x:=c.execute('SELECT * FROM executions WHERE approval_id=?',(a['id'],)).fetchone()) else None
+            parent=c.execute('SELECT parent_approval_id FROM approval_followups WHERE approval_id=?',(a['id'],)).fetchone()
+            a['parent_approval_id']=parent['parent_approval_id'] if parent else None
         d['current_status']=deal_status(c,deal_id)
         approval_ids={a['id'] for a in d['approvals']}
         events=[{'at':d['email']['received_at'],'event':'email_received','details':{}},
@@ -143,6 +149,11 @@ def deal(deal_id: str):
         for event in c.execute('SELECT at,event,details FROM audit ORDER BY id'):
             details=json.loads(event['details'])
             if details.get('deal_id')==deal_id or details.get('approval_id') in approval_ids:
+                if event['event']=='approval_decision':
+                    approval=next((a for a in d['approvals'] if a['id']==details.get('approval_id')),None)
+                    if approval:
+                        details.setdefault('sender',approval.get('sender'))
+                        details.setdefault('comment',approval.get('comments'))
                 events.append({'at':event['at'],'event':event['event'],'details':details})
         d['activity']=sorted(events,key=lambda e:e['at'])
         return d
@@ -159,4 +170,15 @@ def save_draft(deal_id: str, d: Draft):
 @app.post('/api/deals/{deal_id}/approvals')
 def create_approval(deal_id: str):
     return approval_service.create_approval(deal_id)
+
+@app.post('/api/approvals/{approval_id}/cancel')
+def cancel_approval(approval_id: str):
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        approval=row(c,'approvals',approval_id)
+        if approval['status']!='PENDING':
+            raise HTTPException(409,'This approval request is no longer pending')
+        c.execute("UPDATE approvals SET status='CANCELLED' WHERE id=?",(approval_id,))
+        audit(c,'approval_cancelled',{'approval_id':approval_id,'deal_id':approval['deal_id']})
+    return {'status':'CANCELLED'}
 

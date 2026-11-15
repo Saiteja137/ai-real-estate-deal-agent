@@ -5,6 +5,8 @@ _test_database_dir = tempfile.TemporaryDirectory(prefix='deal-agent-tests-')
 os.environ['DATABASE_URL']='sqlite:///' + os.path.join(_test_database_dir.name, 'test.db').replace('\\', '/')
 os.environ['HITL_EMAIL_ENABLED']='false'
 os.environ['LIVE_EMAIL_INGESTION_ENABLED']='false'
+os.environ['AI_ENABLED']='false'
+os.environ['SECOND_DRAFT_APPROVAL_ENABLED']='false'
 os.environ.pop('OPENAI_API_KEY',None)
 from fastapi.testclient import TestClient
 from backend.main import app, db
@@ -20,7 +22,7 @@ def clean(monkeypatch):
     monkeypatch.setenv('APPROVAL_REPLY_TO','inbox@example.com')
     monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs:'SMTP_ACCEPTED')
     with db() as c:
-        for table in ('executions','approvals','deals','emails','audit'): c.execute('DELETE FROM '+table)
+        for table in ('approval_followups','executions','approvals','deals','emails','audit'): c.execute('DELETE FROM '+table)
 
 client=TestClient(app)
 def create():
@@ -58,8 +60,9 @@ def test_approval_and_idempotence():
     d=client.get('/api/deals/'+did).json(); assert d['approvals'][0]['execution']['status']=='SMTP_ACCEPTED'
 def test_rejection_and_unauthorized():
     did,a=approval(); assert reply(a,sender='attacker@example.com').status_code==403
-    assert reply(a,'REJECTED').json()['status']=='REJECTED'
     assert client.get('/api/deals/'+did).json()['approvals'][0]['execution'] is None
+    assert reply(a,'REJECTED').json()['status']=='REJECTED'
+    assert client.get('/api/deals/'+did).json()['approvals'][0]['execution']['status']=='SMTP_ACCEPTED'
 def test_expiration_and_invalidation():
     did,a=approval()
     with db() as c: c.execute("UPDATE approvals SET status='EXPIRED' WHERE id=?",(a['id'],))
@@ -99,13 +102,6 @@ def test_late_reply_cannot_execute():
     assert reply(a).json()['status']=='EXPIRED'
     assert client.get('/api/deals/'+did).json()['approvals'][0]['execution'] is None
 
-def test_html_eml_import_strips_scripts():
-    raw='From: Seller <seller@example.com>\nSubject: Offer\nContent-Type: text/html; charset=utf-8\n\n<p>Hello</p><script>malicious()</script><p>Offer</p>'
-    r=client.post('/api/import-eml',json={'content':raw})
-    assert r.status_code==200
-    assert r.json()['sender']=='seller@example.com'
-    assert 'Hello' in r.json()['body'] and 'malicious' not in r.json()['body']
-
 def test_missing_costs_and_zero_divisor():
     p={'asking_price':0,'arv':100000,'repairs':0,'closing_costs':0,'assignment_fee':0,'selling_costs':0}
     assert metrics(p,DEFAULT_CRITERIA)['roi_percent'] is None
@@ -120,6 +116,7 @@ def test_duplicate_input_and_overview():
 
 def test_openai_drafting_function_call_is_validated(monkeypatch):
     import types, openai
+    from backend import config
     from backend.core import draft
     calls=[]
     class Responses:
@@ -129,6 +126,7 @@ def test_openai_drafting_function_call_is_validated(monkeypatch):
                 return types.SimpleNamespace(id='response_1',output=[types.SimpleNamespace(type='function_call',name='get_missing_information',arguments='{}',call_id='call_1')])
             return types.SimpleNamespace(output_text='Thank you. Please share the missing information.')
     monkeypatch.setenv('OPENAI_API_KEY','fake-test-key')
+    monkeypatch.setattr(config,'AI_ENABLED',True)
     monkeypatch.setattr(openai,'OpenAI',lambda:types.SimpleNamespace(responses=Responses()))
     result=draft({}, {'classification':'INSUFFICIENT_DATA','missing':['arv'],'metrics':{}},'seller@example.com','Offer')
     assert result['recipient']=='seller@example.com'
@@ -270,3 +268,279 @@ def test_hitl_off_new_deal_ready_for_review(monkeypatch):
     assert deal['current_status']=='READY_FOR_REVIEW'
     assert client.get('/api/config').json()['hitl_email_enabled'] is False
     assert client.post(f'/api/deals/{did}/approvals').status_code==409
+
+
+
+
+def test_ambiguous_comments_are_rejected():
+    did,a=approval()
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: First\nComments: Second")
+    assert result.status_code==400
+    assert client.get('/api/deals/'+did).json()['approvals'][0]['status']=='PENDING'
+
+def test_rejection_sends_polite_decline_after_one_decision(monkeypatch):
+    from backend.services import approval_service
+    import json
+    sent=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    did,a=approval(); original=client.get('/api/deals/'+did).json()['draft']
+    assert reply(a,'REJECTED').json()['execution']=='SMTP_ACCEPTED'
+    state=client.get('/api/deals/'+did).json()
+    assert len(sent)==2 and 'not be moving forward' in sent[-1][2]
+    assert state['approvals'][0]['payload']==original
+    assert json.loads(state['approvals'][0]['execution']['payload'])['body']==sent[-1][2]
+    assert reply(a,'REJECTED').status_code==409 and len(sent)==2
+
+def test_approved_comment_is_polished_and_sent_once(monkeypatch):
+    from backend.services import approval_service
+    import json
+    sent=[]; calls=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    monkeypatch.setattr(approval_service,'polish_followup',lambda body,comment,decision:(calls.append((comment,decision)) or ('Polished: '+comment,'openai')))
+    did,a=approval()
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: Please include photos")
+    assert result.json()['execution']=='SMTP_ACCEPTED' and len(sent)==2
+    assert sent[-1][2]=='Polished: Please include photos'
+    state=client.get('/api/deals/'+did).json()
+    assert json.loads(state['approvals'][0]['execution']['payload'])['body']==sent[-1][2]
+    event=next(e for e in state['activity'] if e['event']=='approval_decision')
+    assert event['details']['sender']=='approver@example.com' and event['details']['comment']=='Please include photos'
+    assert calls==[('Please include photos','APPROVED')]
+    assert reply(a).status_code==409 and len(sent)==2
+
+def test_rejected_comment_and_ai_failure_send_fallback(monkeypatch):
+    from backend.services import approval_service
+    import json
+    def fail(*args): raise RuntimeError('API unavailable')
+    monkeypatch.setattr(approval_service,'polish_followup',fail)
+    did,a=approval()
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: REJECTED\nComments: Budget is limited")
+    assert result.json()['execution']=='SMTP_ACCEPTED'
+    state=client.get('/api/deals/'+did).json()
+    assert 'Budget is limited' in json.loads(state['approvals'][0]['execution']['payload'])['body']
+    assert any(e['event']=='final_reply_prepared' and e['details']['source']=='template_after_ai_error' for e in state['activity'])
+
+def test_ai_disabled_ignores_configured_key(monkeypatch):
+    import openai
+    from backend import config
+    from backend.agents.property_agent import extract
+    from backend.agents.email_agent import draft, polish_followup
+    monkeypatch.setattr(config,'AI_ENABLED',False)
+    monkeypatch.setenv('OPENAI_API_KEY','fake-key')
+    def forbidden(*args,**kwargs): raise AssertionError('OpenAI must not be called when AI is disabled')
+    monkeypatch.setattr(openai,'OpenAI',forbidden)
+    properties,source=extract('Offer','Location: Dallas\nAsking Price: $115,000\nARV: $220,000\nRepairs: $35,000')
+    assert properties[0]['asking_price']==115000 and 'AI disabled' in source
+    assert 'Thank you' in draft({}, {'classification':'REJECT','missing':[],'metrics':{}},'seller@example.com','Offer')['body']
+    assert polish_followup('Draft','note','APPROVED')==('Draft','template')
+
+def test_langchain_ai_evaluation_uses_precomputed_metrics(monkeypatch):
+    from backend.agents import evaluation_agent
+    received={}
+    class FakeModel:
+        def __init__(self, **kwargs): received['config']=kwargs
+        def with_structured_output(self, schema, method):
+            received['schema']=schema; received['method']=method; return self
+        def invoke(self, messages):
+            received['messages']=messages
+            return {'classification':'NEGOTIATE','explanation':'Price requires review.','strengths':['Location stated'],'risks':['Verify repairs'],'passed':['Minimum ARV'],'failed':[],'suggested_next_action':'Request more details.'}
+    monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
+    rule={'classification':'POTENTIAL_MATCH','metrics':{'mao':119000},'criteria':{},'missing':[]}
+    result=evaluation_agent.assess_property({'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000},rule)
+    assert result['classification']=='NEGOTIATE'
+    assert received['config']['use_responses_api'] is True
+    assert received['method']=='json_schema'
+    assert '119000' in received['messages'][1].content
+
+def test_graph_uses_ai_classification_but_keeps_python_metrics(monkeypatch):
+    from backend import config
+    from backend.workflows import deal_workflow
+    monkeypatch.setattr(config,'AI_ENABLED',True)
+    def no_python_classification(*args): raise AssertionError('Python classification should not run in AI mode')
+    monkeypatch.setattr(deal_workflow,'evaluate',no_python_classification)
+    monkeypatch.setattr(deal_workflow,'extract',lambda subject,body:([{'asking_price':115000,'arv':220000,'repairs':35000}], 'mock AI'))
+    monkeypatch.setattr(deal_workflow,'assess_property',lambda p,e:{'classification':'NEGOTIATE','explanation':'Review terms','strengths':[],'risks':['Unverified'],'passed':[],'failed':[],'suggested_next_action':'Ask for details'})
+    monkeypatch.setattr(deal_workflow,'draft',lambda p,e,sender,subject:{'recipient':sender,'subject':subject,'body':'draft'})
+    result=deal_workflow.run_workflow('Offer','body','seller@example.com',DEFAULT_CRITERIA)['results'][0]
+    ev=result['evaluation']
+    assert ev['classification']=='NEGOTIATE' and 'rule_classification' not in ev
+    assert ev['metrics']['mao']==119000 and ev['metrics']['gross_spread']==70000
+    assert ev['evaluation_source']=='openai'
+
+def test_second_approval_reviews_exact_polished_reply(monkeypatch):
+    import json
+    from backend import config
+    from backend.services import approval_service
+    sent=[]; polish_calls=[]
+    monkeypatch.setattr(config,'SECOND_DRAFT_APPROVAL_ENABLED',True)
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    monkeypatch.setattr(approval_service,'polish_followup',lambda body,comment,decision:(polish_calls.append(comment) or ('Polished: '+comment,'openai')))
+    did,first=approval()
+    result=reply(first,text=f"Approval ID: {first['id']}\nDecision: APPROVED\nComments: Please send photos")
+    assert result.json()['execution']=='AWAITING_SECOND_APPROVAL'
+    assert len(sent)==2  # two notifications, no wholesaler email
+    second_id=result.json()['followup_approval_id']
+    deal=client.get('/api/deals/'+did).json()
+    second=next(a for a in deal['approvals'] if a['id']==second_id)
+    assert second['parent_approval_id']==first['id'] and second['payload']['body']=='Polished: Please send photos'
+    assert 'Polished: Please send photos' in second['notification']
+    monkeypatch.setattr(config,'SECOND_DRAFT_APPROVAL_ENABLED',False) # persisted stage remains enforced
+    second_reply={'id':second_id}
+    assert reply(second_reply,text=f"Approval ID: {second_id}\nDecision: APPROVED\nComments: more changes").status_code==400
+    assert len(sent)==2
+    assert reply(second_reply).json()['execution']=='SMTP_ACCEPTED'
+    assert len(sent)==3 and sent[-1][2]=='Polished: Please send photos'
+    assert polish_calls==['Please send photos']
+    state=client.get('/api/deals/'+did).json()
+    sent_execution=next(a['execution'] for a in state['approvals'] if a['id']==second_id)
+    assert json.loads(sent_execution['payload'])==second['payload']
+    assert reply(second_reply).status_code==409 and len(sent)==3
+
+def test_second_approval_rejection_cancels_sending(monkeypatch):
+    from backend import config
+    from backend.services import approval_service
+    sent=[]
+    monkeypatch.setattr(config,'SECOND_DRAFT_APPROVAL_ENABLED',True)
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    did,first=approval()
+    result=reply(first,'REJECTED').json()
+    assert result['execution']=='AWAITING_SECOND_APPROVAL' and len(sent)==2
+    second={'id':result['followup_approval_id']}
+    rejected=reply(second,'REJECTED')
+    assert rejected.json()['status']=='REJECTED' and rejected.json()['execution'] is None
+    assert len(sent)==2
+    with db() as c: assert c.execute('SELECT 1 FROM executions WHERE approval_id=?',(second['id'],)).fetchone() is None
+
+def test_second_approval_notification_failure_never_sends_wholesaler(monkeypatch):
+    from backend import config
+    from backend.services import approval_service
+    calls=[]
+    monkeypatch.setattr(config,'SECOND_DRAFT_APPROVAL_ENABLED',True)
+    def send(*args,**kwargs):
+        calls.append(args)
+        if len(calls)==2: raise TimeoutError('notification outcome unknown')
+        return 'SMTP_ACCEPTED'
+    monkeypatch.setattr(approval_service.email_service,'send_message',send)
+    did,first=approval()
+    result=reply(first,text=f"Approval ID: {first['id']}\nDecision: APPROVED\nComments: More information")
+    assert result.json()['execution']=='SECOND_APPROVAL_ERROR'
+    assert len(calls)==2
+    with db() as c:
+        assert c.execute('SELECT status FROM executions WHERE approval_id=?',(first['id'],)).fetchone()[0]=='SECOND_APPROVAL_ERROR'
+
+def test_second_approval_does_not_overwrite_draft_changed_during_polishing(monkeypatch):
+    from backend import config
+    from backend.services import approval_service
+    sent=[]
+    monkeypatch.setattr(config,'SECOND_DRAFT_APPROVAL_ENABLED',True)
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    did,a=approval()
+    def polish(body,comment,decision):
+        current=client.get('/api/deals/'+did).json()['draft']; current['body']='Human changed this draft'
+        assert client.put('/api/deals/'+did+'/draft',json=current).status_code==200
+        return 'AI replacement','openai'
+    monkeypatch.setattr(approval_service,'polish_followup',polish)
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: Please include photos")
+    assert result.json()['execution']=='SECOND_APPROVAL_ERROR'
+    assert client.get('/api/deals/'+did).json()['draft']['body']=='Human changed this draft'
+    assert len(sent)==1
+
+@pytest.mark.parametrize('body',[
+    'We expect a guaranteed profit of $999,999.',
+    'We will buy the property immediately.',
+    'Please visit https://untrusted.example/path.',
+    'Contact invented@example.com for details.',
+])
+def test_ai_draft_guardrail_rejects_unsupported_content(body):
+    from backend.agents.guardrails import validate_reply
+    with pytest.raises(ValueError): validate_reply(body, {'property':'A Dallas property','arv':220000})
+
+def test_ai_draft_guardrail_allows_supplied_values():
+    from backend.agents.guardrails import validate_reply
+    message='Would the seller consider a non-binding offer near $119,000?'
+    assert validate_reply(message, {'metrics':{'mao':119000}})==message
+
+def test_ai_hallucinated_number_falls_back_before_sending(monkeypatch):
+    from backend.services import approval_service
+    import json
+    sent=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    monkeypatch.setattr(approval_service,'polish_followup',lambda *args:('Your guaranteed payout is $999,999.','openai'))
+    did,a=approval()
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: Please share photos")
+    assert result.json()['execution']=='SMTP_ACCEPTED'
+    assert '$999,999' not in sent[-1][2] and 'Please share photos' in sent[-1][2]
+    state=client.get('/api/deals/'+did).json()
+    assert any(e['event']=='final_reply_prepared' and e['details']['source']=='template_after_guardrail' for e in state['activity'])
+    assert json.loads(state['approvals'][0]['execution']['payload'])['body']==sent[-1][2]
+
+def test_unsafe_comment_requires_review_without_sending(monkeypatch):
+    from backend.services import approval_service
+    sent=[]
+    monkeypatch.setattr(approval_service.email_service,'send_message',lambda *args,**kwargs: sent.append(args) or 'SMTP_ACCEPTED')
+    did,a=approval()
+    result=reply(a,text=f"Approval ID: {a['id']}\nDecision: APPROVED\nComments: We will buy the property tomorrow")
+    assert result.json()['execution']=='REQUIRES_REVIEW'
+    assert len(sent)==1  # Only the approval notification was sent.
+    assert client.get('/api/deals/'+did).json()['current_status']=='REQUIRES_REVIEW'
+
+def test_ai_assessment_cannot_classify_missing_core_data_as_match(monkeypatch):
+    from backend.agents import evaluation_agent
+    class FakeModel:
+        def __init__(self,**kwargs): pass
+        def with_structured_output(self,*args,**kwargs): return self
+        def invoke(self,messages):
+            return {'classification':'STRONG_MATCH','explanation':'Looks strong','strengths':[],'risks':[],'passed':[],'failed':[],'suggested_next_action':'Review'}
+    monkeypatch.setattr(evaluation_agent,'ChatOpenAI',FakeModel)
+    with pytest.raises(ValueError): evaluation_agent.assess_property({'asking_price':100000,'arv':None,'repairs':None},{'metrics':{},'criteria':{},'missing':['arv','repairs']})
+
+def test_model_permission_error_is_explained_without_exposing_details(monkeypatch):
+    import httpx, openai
+    from backend.api import routes
+    response=httpx.Response(403,request=httpx.Request('POST','https://api.openai.com/v1/responses'))
+    def fail(*args,**kwargs):
+        raise openai.PermissionDeniedError('private provider details',response=response,body=None)
+    monkeypatch.setattr(routes,'run_workflow',fail)
+    result=client.post('/api/emails',json={'sender':'seller@example.com','subject':'Offer','body':'Property offer'})
+    assert result.status_code==502
+    assert 'model is unavailable' in result.json()['detail']
+    assert 'private provider details' not in result.text
+    with db() as c: assert c.execute('SELECT count(*) FROM emails').fetchone()[0]==0
+
+def test_approval_notification_explains_deal_and_unknown_costs():
+    from backend.services.approval_notification import build_notification
+    property_details={'city':'Dallas','asking_price':115000,'arv':220000,'repairs':35000}
+    evaluation={'classification':'POTENTIAL_MATCH','evaluation_source':'openai','initial_draft_source':'openai','explanation':'Asking price is below the calculated offer.','suggested_next_action':'Request photos.','metrics':{'mao':119000,'gross_spread':70000,'estimated_profit':None,'roi_percent':None},'risks':['Estimates are unverified'],'passed':['Repair limit'],'failed':[],'missing':['address'],'assumptions':['Unknown costs are not zero']}
+    draft={'recipient':'seller@example.com','subject':'Re: Offer','body':'Please share photos.'}
+    message=build_notification('RE-123','2026-01-01T00:20:00+00:00',property_details,evaluation,draft)
+    assert 'OpenAI-assisted evaluation' in message and 'Asking price is below the calculated offer.' in message
+    assert '$119,000.00' in message and '$70,000.00' in message
+    assert 'Estimated net profit (calculated): Not available' in message
+    assert 'Estimates are unverified' in message and 'Request photos.' in message
+    assert 'address' in message and draft['body'] in message
+
+def test_reanalyze_creates_new_deal_without_duplicate_email():
+    did=create()
+    old=client.get('/api/deals/'+did).json()
+    result=client.post(f'/api/deals/{did}/reanalyze')
+    assert result.status_code==200
+    new_id=result.json()['deal_ids'][0]
+    assert new_id!=did
+    new=client.get('/api/deals/'+new_id).json()
+    assert new['email_id']==old['email_id']
+    with db() as c:
+        assert c.execute('SELECT count(*) FROM emails').fetchone()[0]==1
+        assert c.execute('SELECT count(*) FROM deals').fetchone()[0]==2
+
+def test_reanalyze_refuses_while_related_approval_pending():
+    did,a=approval()
+    assert client.post(f'/api/deals/{did}/reanalyze').status_code==409
+    assert client.get('/api/deals/'+did).json()['approvals'][0]['status']=='PENDING'
+
+def test_cancel_pending_approval_allows_reanalysis_and_blocks_late_reply():
+    did,a=approval()
+    assert client.post(f'/api/deals/{did}/reanalyze').status_code==409
+    assert client.post(f"/api/approvals/{a['id']}/cancel").json()['status']=='CANCELLED'
+    assert reply(a).status_code==409
+    assert client.post(f'/api/deals/{did}/reanalyze').status_code==200
+    with db() as c: assert c.execute('SELECT count(*) FROM executions WHERE approval_id=?',(a['id'],)).fetchone()[0]==0

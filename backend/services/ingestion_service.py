@@ -2,8 +2,21 @@
 import email, imaplib, os, re
 from email import policy
 from email.utils import parseaddr
+from html.parser import HTMLParser
 from fastapi import HTTPException
 from backend.database import db, now, stamp, audit
+
+
+class PlainHTML(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.parts=[]; self.hidden=0
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script','style'): self.hidden+=1
+        if tag in ('p','br','div','li','tr'): self.parts.append('\n')
+    def handle_endtag(self, tag):
+        if tag in ('script','style') and self.hidden: self.hidden-=1
+    def handle_data(self, data):
+        if not self.hidden: self.parts.append(data)
 
 OFFER = re.compile(r'\b(property|real estate|off.market|wholesale|investment opportunity)\b', re.I)
 PRICE = re.compile(r'\b(asking|price|arv|repairs?)\b|\$\s*\d', re.I)
@@ -34,7 +47,6 @@ def poll_incoming():
             body=part.get_content() if part and part.get_content_type() in ('text/plain','text/html') else ''
             text=body if isinstance(body,str) else ''
             if part and part.get_content_type()=='text/html':
-                from backend.api.routes import PlainHTML
                 parser=PlainHTML(); parser.feed(text); text=''.join(parser.parts)
             result='IGNORED'
             if sender and OFFER.search(subject+'\n'+text) and PRICE.search(subject+'\n'+text) and not re.search(r'(?im)^\s*(Decision|Approval ID):',text):
