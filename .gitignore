@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# React build and local runtime data
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+data/*.db
