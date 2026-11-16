@@ -1,5 +1,5 @@
 from backend.agents.property_agent import extract
-from backend.agents.email_agent import draft
+from backend.agents.email_agent import draft, resolution_intent
 from backend.tools.deal_evaluation import evaluate
 from backend.agents.evaluation_agent import assess_property
 from backend.tools.roi_calculator import metrics
@@ -19,6 +19,7 @@ def run_workflow(subject, body, sender, criteria):
         results: list
     def extraction_node(s):
         properties, source = extract(s['subject'], s['body'])
+        properties = [p for p in properties if any(value is not None and value != '' and value != [] and value != {} for key, value in p.items() if key != 'contradictions')]
         return {'properties': properties, 'source': source}
     def evaluation_node(s):
         results=[]
@@ -36,10 +37,9 @@ def run_workflow(subject, body, sender, criteria):
                 ev=evaluate(p,s['criteria'])
                 ev['criteria_results']=criteria_checks(p,s['criteria'],ev['metrics'])
                 ev['evaluation_source']='python_rules'
+            ev['resolution_intent']=resolution_intent(ev)
             ev['initial_draft_source']='openai' if config.AI_ENABLED else 'template'
-            proposed=draft(p,ev,s['sender'],s['subject'])
-            if config.AI_ENABLED:
-                ev['ai_review']={'status':'passed','stages':['extraction','evaluation','draft']}
+            proposed=draft(p,ev,s['sender'],s['subject'],original_email=s['body'])
             results.append({'property':p,'evaluation':ev,'draft':proposed})
         return {'results':results}
     graph=StateGraph(State)

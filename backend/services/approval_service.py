@@ -10,9 +10,7 @@ from backend.database import db, now, stamp, payload_hash, audit, row, unpack
 
 from backend.services import email_service
 from backend.services.approval_notification import build_notification, notification_html
-from backend.agents.email_agent import polish_followup
-from backend.agents.guardrails import validate_reply
-from backend.agents.reflection_agent import ReflectionError
+from backend.agents.email_agent import polish_followup, template_content
 
 
 
@@ -142,15 +140,15 @@ def process_reply(approval_id, sender, text, received):
         audit(c,'approval_decision',{'approval_id':approval_id,'status':status,'execution':execution,'sender':sender,'comment':comment or None,'received_at':stamp(received)})
 
     final_payload = dict(payload)
+    with db() as c:
+        deal_context = unpack(row(c, 'deals', a['deal_id']), ['property', 'evaluation', 'draft'])
     if status == 'REJECTED' and not is_followup:
-        with db() as c:
-            deal = row(c, 'deals', a['deal_id'])
-        property_details = json.loads(deal['property'])
+        property_details = deal_context['property']
         name = property_details.get('wholesaler_name') or 'there'
         signature = '\n'.join(part for part in (os.getenv('BUYER_NAME', 'Example Buyer'), os.getenv('BUYER_COMPANY', '')) if part)
         final_payload['body'] = (f'Hi {name},\n\nThank you for sharing this opportunity.\n\n'
             'After reviewing the available information, we will not be moving forward '
-            'with this property at this time. Please keep us in mind for future opportunities.\n\n'
+            'with this property at this time. ' + template_content(property_details, {**deal_context['evaluation'], 'recommended_action':'DECLINE'}) + '\n\n'
             f'Best regards,\n{signature}')
     if comment:
         final_payload['body'] += f'\n\nAdditional note: {comment}'
@@ -158,27 +156,10 @@ def process_reply(approval_id, sender, text, received):
     source='original' if status=='APPROVED' and not comment else 'template'
     if not is_followup and (comment or status=='REJECTED'):
         try:
-            final_payload['body'], source = polish_followup(final_payload['body'], comment, status)
-        except ReflectionError:
-            with db() as c:
-                c.execute("UPDATE executions SET status='REQUIRES_REVIEW',payload=? WHERE approval_id=? AND status IN ('PREPARING','PREPARING_REVIEW')",(json.dumps(final_payload),approval_id))
-                audit(c,'reply_requires_review',{'approval_id':approval_id,'deal_id':a['deal_id'],'recipient':final_payload['recipient'],'reason':'AI quality review could not validate the reply'})
-            return {'status':status,'execution':'REQUIRES_REVIEW'}
+            final_payload['body'], source = polish_followup(final_payload['body'], comment, status, context={'property':deal_context['property'], 'evaluation':deal_context['evaluation'], 'original_draft':payload['body']})
         except Exception:
             # Keep the drafted reply and the note when AI is unavailable.
             source='template_after_ai_error'
-        try:
-            validate_reply(final_payload['body'], {'approved_draft':payload['body'],'comment':comment,'template':template_body})
-        except ValueError:
-            final_payload['body'] = template_body
-            source = 'template_after_guardrail'
-            try:
-                validate_reply(template_body, {'approved_draft':payload['body'],'comment':comment,'template':template_body})
-            except ValueError:
-                with db() as c:
-                    c.execute("UPDATE executions SET status='REQUIRES_REVIEW',payload=? WHERE approval_id=? AND status IN ('PREPARING','PREPARING_REVIEW')",(json.dumps(final_payload),approval_id))
-                    audit(c,'reply_requires_review',{'approval_id':approval_id,'deal_id':a['deal_id'],'recipient':final_payload['recipient']})
-                return {'status':status,'execution':'REQUIRES_REVIEW'}
     if needs_second_review:
         try:
             followup = create_approval(a['deal_id'],followup_of=approval_id,prepared_payload=final_payload)
@@ -195,8 +176,6 @@ def process_reply(approval_id, sender, text, received):
         updated=c.execute("UPDATE executions SET payload=?,status='SENDING' WHERE approval_id=? AND status='PREPARING'",(json.dumps(final_payload),approval_id))
         if updated.rowcount != 1: raise RuntimeError('Execution reservation unavailable')
         audit(c,'final_reply_prepared',{'deal_id':a['deal_id'],'approval_id':approval_id,'source':source,'decision':status,'recipient':final_payload['recipient']})
-        if source == 'openai':
-            audit(c,'ai_reply_review_passed',{'deal_id':a['deal_id'],'approval_id':approval_id})
         audit(c,'wholesaler_send_started',{'deal_id':a['deal_id'],'approval_id':approval_id,'recipient':final_payload['recipient']})
     try:
         result=email_service.send_message(final_payload['recipient'],final_payload['subject'],final_payload['body'])

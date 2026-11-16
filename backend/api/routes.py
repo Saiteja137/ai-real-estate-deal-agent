@@ -55,7 +55,7 @@ def analyze_email(subject, body, sender, criteria):
     try:
         return run_workflow(subject,body,sender,criteria)
     except ReflectionError as exc:
-        raise HTTPException(502,'The AI quality review could not validate the analysis or draft. Please review the email and try again.') from exc
+        raise HTTPException(502,'The AI quality review could not validate the property analysis. Please review the email and try again.') from exc
     except openai.AuthenticationError as exc:
         raise HTTPException(502,'OpenAI authentication failed. Check OPENAI_API_KEY in .env and restart the backend.') from exc
     except (openai.PermissionDeniedError, openai.NotFoundError) as exc:

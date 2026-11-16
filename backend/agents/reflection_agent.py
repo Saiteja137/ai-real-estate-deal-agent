@@ -35,7 +35,7 @@ def retry_ai_output(function):
             except ValueError as exc:
                 if attempt == MAX_QUALITY_RETRIES:
                     raise ReflectionError('AI output could not pass quality validation after retries') from exc
-                log.warning('AI quality validation failed for %s; retry %s of %s', function.__name__, attempt + 1, MAX_QUALITY_RETRIES)
+                log.warning('AI quality validation failed for %s (%s); retry %s of %s', function.__name__, str(exc), attempt + 1, MAX_QUALITY_RETRIES)
             finally:
                 _retry_attempt.reset(token)
     return wrapped

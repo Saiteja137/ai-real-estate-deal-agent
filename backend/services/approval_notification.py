@@ -29,7 +29,7 @@ def build_notification(approval_id, deadline, property_details, evaluation, repl
     if action_label:
         next_action=f'{action_label}: {next_action}'
     source={'openai':'AI Deal Evaluation Agent (Artificial Intelligence)','python_rules':'Rule-based Deal Evaluation'}.get(ev.get('evaluation_source'),'Not recorded for this deal')
-    draft_source={'openai':'AI Reply Drafting Agent (Artificial Intelligence)','template':'Standard template'}.get(ev.get('initial_draft_source'),'Not recorded for this deal')
+    draft_source={'openai':'AI Reply Drafting Agent (Artificial Intelligence)','template':'Standard template','template_after_ai_failure':'Standard template (AI draft could not be validated)'}.get(ev.get('initial_draft_source'),'Not recorded for this deal')
     criteria_results=ev.get('criteria_results') or []
     status_labels={'MET':'Met','NOT_MET':'Not met','UNKNOWN':'Unknown','INFORMATIONAL':'Configured'}
     criteria_lines=[f"{item['name']}: {status_labels.get(item['status'],'Unknown')} — {item['requirement']}" for item in criteria_results]
@@ -71,6 +71,7 @@ Estimated ROI (Return on Investment), calculated: {_amount(metrics.get('roi_perc
 
 AI RECOMMENDATION
 Classification: {ev.get('classification') or 'Not available'}
+Resolution intent: {actions.get(ev.get('resolution_intent'), 'Not recorded for this deal')}
 Evaluation source: {source}
 Reasoning: {buyer_explanation}
 Suggested next action: {next_action}

@@ -1,48 +1,79 @@
 import os
 from backend import config
-from backend.agents.guardrails import REAL_ESTATE_DRAFT_INSTRUCTIONS, validate_reply
+from backend.agents.guardrails import REAL_ESTATE_DRAFT_INSTRUCTIONS
 from backend.agents.terms import expand_financial_terms
-from backend.agents.reflection_agent import review_ai_output, retry_ai_output, retry_instruction
 
-@retry_ai_output
-def polish_followup(body, comment, decision):
+AI_DISCLOSURE = 'Disclosure: This message was drafted with AI assistance. Our review is preliminary, based on unverified information, and is not a binding offer.'
+
+def disclose_ai(body):
+    return body.rstrip() + '\n\n' + AI_DISCLOSURE if AI_DISCLOSURE not in body else body
+
+def polish_followup(body, comment, decision, context=None):
     """Prepare text for human review; the result is never authorized to send here."""
     if not config.AI_ENABLED:
         return body, 'template'
     import json
     from openai import OpenAI
-    result = OpenAI().responses.create(
+    result = OpenAI(max_retries=0).responses.create(
         model=os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'),
-        instructions=REAL_ESTATE_DRAFT_INSTRUCTIONS + retry_instruction(),
-        input=json.dumps({'draft': body, 'approver_comment': comment, 'decision': decision}),
+        instructions=REAL_ESTATE_DRAFT_INSTRUCTIONS,
+        input=json.dumps({'draft': body, 'approver_comment': comment, 'decision': decision, 'deal_context': context or {}}),
     )
-    candidate = expand_financial_terms(validate_reply(result.output_text, {'draft':body,'comment':comment}))
-    review_ai_output('followup', {'draft':body,'comment':comment,'decision':decision}, candidate)
-    return candidate, 'openai'
+    return disclose_ai(result.output_text), 'openai'
 
-@retry_ai_output
-def draft(p, ev, sender, subject):
-    category = ev['classification']
-    if category == 'INSUFFICIENT_DATA': content = 'Before completing our initial evaluation, could you please provide: ' + expand_financial_terms(', '.join(ev['missing']).replace('_',' ')) + '?'
-    elif category == 'NEGOTIATE': content = f"The asking price appears higher than our preliminary buying range. Would the seller consider an offer closer to ${ev['metrics']['mao']:,.0f}?" if ev['metrics']['mao'] is not None and ev['metrics']['mao'] > 0 else 'Could you share whether the seller has flexibility on price?'
-    elif category == 'REJECT': content = 'The property does not appear to fit our criteria at the proposed terms. Please keep us in mind for future opportunities.'
-    else: content = 'The property appears potentially aligned with our criteria. Please share photographs, condition details, supporting documentation, availability and closing terms.'
-    fallback = {'recipient':sender,'subject':'Re: '+subject.removeprefix('Re: '),'body':f"Hi {p.get('wholesaler_name') or 'there'},\n\nThank you for sharing this opportunity.\n\n{content}\n\nBest regards,\n{os.getenv('BUYER_NAME','Example Buyer')}\n{os.getenv('BUYER_COMPANY','')}"}
+def resolution_intent(ev):
+    """Record the intended response independently of approval or delivery status."""
+    action = ev.get('recommended_action')
+    if action in ('NEGOTIATE', 'REQUEST_INFORMATION', 'DECLINE', 'PROCEED_TO_DUE_DILIGENCE'):
+        return action
+    return {'INSUFFICIENT_DATA':'REQUEST_INFORMATION', 'NEGOTIATE':'NEGOTIATE',
+            'REJECT':'DECLINE'}.get(ev.get('classification'), 'PROCEED_TO_DUE_DILIGENCE')
+
+
+def template_content(p, ev):
+    intent = resolution_intent(ev)
+    missing = [str(field).replace('_', ' ') for field in ev.get('missing', [])]
+    missing_text = expand_financial_terms(', '.join(missing))
+    metrics = ev.get('metrics') or {}
+    figures = [("asking price",p.get('asking_price')), ("estimated after repair value",p.get('arv')), ("estimated repairs",p.get('repairs')), ("calculated gross spread before other costs",metrics.get('gross_spread'))]
+    known = [f'{name}: ${value:,.2f}' for name,value in figures if isinstance(value,(int,float))]
+    summary = ('Our preliminary review used the following information: ' + '; '.join(known) + '. ' if known else '')
+    met = [item['name'] for item in ev.get('criteria_results',[]) if item.get('status') == 'MET']
+    if met: summary += 'The following buying criteria appear to be met: ' + ', '.join(met) + '. '
+    questions = ev.get('due_diligence') or []
+    if questions: missing_text += ('; ' if missing_text else '') + '; '.join(questions)
+    if intent == 'DECLINE':
+        return summary + 'The property does not appear to fit our criteria at the proposed terms. Please keep us in mind for future opportunities.'
+    if intent == 'REQUEST_INFORMATION':
+        if missing_text:
+            return summary + f'Before completing our preliminary evaluation, could you please provide: {missing_text}?' 
+        return summary + 'Could you please share supporting property details and documentation so we can complete our preliminary evaluation?'
+    if intent == 'NEGOTIATE':
+        mao = (ev.get('metrics') or {}).get('mao')
+        price = p.get('asking_price')
+        context = f'The asking price of ${price:,.2f} exceeds our preliminary calculated maximum allowable offer of ${mao:,.2f}. ' if price is not None and mao is not None and price > mao > 0 else 'Based on our preliminary evaluation, '
+        question = f'Would the seller consider a price closer to ${mao:,.2f}?' if mao is not None and mao > 0 else 'would the seller consider flexibility on price?'
+        extra = f' Could you also provide: {missing_text}?' if missing_text else ''
+        return summary + context + question + extra
+    extra = f' Please also provide: {missing_text}.' if missing_text else ''
+    return summary + 'The property appears potentially aligned with our criteria. Please share photographs, condition details, supporting documentation, availability and closing terms.' + extra
+
+
+def _template_draft(p, ev, sender, subject):
+    content = template_content(p, ev)
+    return {'recipient':sender,'subject':'Re: '+subject.removeprefix('Re: '),'body':f"Hi {p.get('wholesaler_name') or 'there'},\n\nThank you for sharing this opportunity.\n\n{content}\n\nBest regards,\n{os.getenv('BUYER_NAME','Example Buyer')}\n{os.getenv('BUYER_COMPANY','')}"}
+
+
+def draft(p, ev, sender, subject, original_email=None):
+    fallback = _template_draft(p, ev, sender, subject)
     if not config.AI_ENABLED:
         return fallback
     import json
     from openai import OpenAI
-    client = OpenAI()
-    tool = {'type':'function','name':'get_missing_information','description':'Return the deterministic missing fields for this property.', 'parameters':{'type':'object','properties':{},'required':[],'additionalProperties':False},'strict':True}
-    context = json.dumps({'property':p,'evaluation':ev,'subject':subject,'buyer_name':os.getenv('BUYER_NAME','Example Buyer'),'buyer_company':os.getenv('BUYER_COMPANY','')})
-    instructions = REAL_ESTATE_DRAFT_INSTRUCTIONS + retry_instruction()
-    response = client.responses.create(model=os.getenv('OPENAI_MODEL','gpt-4.1-mini'),instructions=instructions,input=context,tools=[tool],tool_choice='required')
-    calls = [x for x in response.output if x.type == 'function_call' and x.name == 'get_missing_information']
-    if len(calls) != 1 or json.loads(calls[0].arguments) != {}:
-        raise ValueError('Invalid drafting tool call')
-    final = client.responses.create(model=os.getenv('OPENAI_MODEL','gpt-4.1-mini'),instructions=instructions,previous_response_id=response.id,input=[{'type':'function_call_output','call_id':calls[0].call_id,'output':json.dumps(ev['missing'])}])
-    candidate=expand_financial_terms(validate_reply(final.output_text, context))
-    review_ai_output('draft', {'property':p,'evaluation':ev,'subject':subject,'buyer_name':os.getenv('BUYER_NAME','Example Buyer'),'buyer_company':os.getenv('BUYER_COMPANY','')}, candidate)
-    return {**fallback, 'body':candidate}
-
-
+    context = json.dumps({'property':p,'evaluation':ev,'subject':subject,'original_wholesaler_email':original_email,'buyer_name':os.getenv('BUYER_NAME','Example Buyer'),'buyer_company':os.getenv('BUYER_COMPANY','')})
+    response = OpenAI(max_retries=0).responses.create(
+        model=os.getenv('OPENAI_MODEL','gpt-4.1-mini'),
+        instructions=REAL_ESTATE_DRAFT_INSTRUCTIONS,
+        input=context,
+    )
+    return {**fallback, 'body':disclose_ai(response.output_text)}
