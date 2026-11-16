@@ -20,6 +20,14 @@ AI extraction, evaluation, initial drafting, and follow-up generation use direct
 
 The deal reply agent in `backend/agents/deal_reply_agent.py` uses the wholesaler email and completed evaluation to draft an acquisitions-focused response. It follows the saved resolution intent, addresses relevant terms and missing information, and includes an AI-assistance disclosure when AI drafts the response. The buyer should review the message before approving it.
 
+To run the backend and frontend development servers together in Git Bash, complete the dependency setup above, then run:
+
+```bash
+bash run-dev.sh
+```
+
+Open the Vite URL printed in the terminal (normally http://127.0.0.1:5173). Press Ctrl+C to stop both servers. The backend remains available on http://127.0.0.1:8000.
+
 ## Continuous integration
 
 GitHub Actions runs the checks in `.github/workflows/ci.yml` on every push and pull request, and can also be started from the Actions tab. The backend job checks Python syntax, lints for errors and runs the test suite. The frontend job installs the locked dependencies, runs ESLint, checks TypeScript and builds the application. It does not deploy anything.
