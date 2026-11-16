@@ -8,3 +8,5 @@
 .buyer-criteria{margin-top:18px;padding:15px;border:1px solid #e1eadf;border-radius:9px;background:#fbfdfb}.buyer-criteria>b{font-size:12px;color:#355d48}.buyer-criteria>p{font-size:11px}.buyer-criteria ul{list-style:none;margin:8px 0 0;padding:0}.buyer-criteria li{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid #edf2ed;font-size:11px}.buyer-criteria li b,.buyer-criteria li small{display:block}.buyer-criteria li small{color:#82968a;margin-top:3px}.criterion-status{white-space:nowrap;border-radius:12px;padding:5px 8px;font-size:10px;font-weight:700;background:#edf3ef;color:#607a6b}.criterion-status.met{background:#e4f3e9;color:#367851}.criterion-status.not_met{background:#fbe9e6;color:#a24b40}.criterion-status.unknown{background:#fff4dc;color:#92712a}
 
 .resolution-badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+
+.deal-row-status{display:flex;flex-direction:column;align-items:flex-end;gap:5px}.deal-row-status small{color:#527167;text-align:right;font-weight:600}

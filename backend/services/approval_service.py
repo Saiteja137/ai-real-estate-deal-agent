@@ -10,7 +10,7 @@ from backend.database import db, now, stamp, payload_hash, audit, row, unpack
 
 from backend.services import email_service
 from backend.services.approval_notification import build_notification, notification_html
-from backend.agents.email_agent import polish_followup, template_content
+from backend.agents.deal_reply_agent import polish_followup, template_content
 
 
 

@@ -18,6 +18,8 @@ Open http://127.0.0.1:8000. Set `AI_ENABLED=true`, `OPENAI_API_KEY`, and `OPENAI
 
 AI extraction, evaluation, initial drafting, and follow-up generation use direct model responses without quality-validation retries or reflection review. The extraction and evaluation APIs still require structured output so the application can process the fields. Review AI output carefully: it can contain unsupported claims, inconsistent recommendations, or unsafe wording. Financial metrics remain Python calculations.
 
+The deal reply agent in `backend/agents/deal_reply_agent.py` uses the wholesaler email and completed evaluation to draft an acquisitions-focused response. It follows the saved resolution intent, addresses relevant terms and missing information, and includes an AI-assistance disclosure when AI drafts the response. The buyer should review the message before approving it.
+
 ## Continuous integration
 
 GitHub Actions runs the checks in `.github/workflows/ci.yml` on every push and pull request, and can also be started from the Actions tab. The backend job checks Python syntax, lints for errors and runs the test suite. The frontend job installs the locked dependencies, runs ESLint, checks TypeScript and builds the application. It does not deploy anything.
@@ -85,3 +87,9 @@ Approval emails include Approve and Reject links. Each opens a prefilled email r
 The buyer decision brief uses a senior acquisitions-advisor prompt. The application calculates every configured buying criterion as met, not met, unknown, or informational, and supplies those results to the AI; the AI provides the verdict and explanation without overriding a failed mandatory requirement. The buyer approval message shows the complete checklist, concise reasoning, recommended next action, and up to three risks and three due-diligence questions. If required facts are missing, the AI is instructed to request them instead of inventing figures. Existing evaluations retain their original snapshots; reanalyze to use the updated prompt.
 
 The deal activity timeline shows the approver and comment, reply preparation, the wholesaler address, the start of sending, and the resulting mail-server status. The dashboard refreshes the selected deal about every 10 seconds while it is visible and keeps unsaved draft edits. Mail-server acceptance is not proof of delivery.
+
+
+
+#### Clear db
+
+`python -c "import sqlite3; from backend.database import DB; c=sqlite3.connect(DB); tables=('approval_followups','executions','approvals','deals','emails','mailbox_messages','audit'); [c.execute('DELETE FROM '+t) for t in tables]; c.commit(); c.close(); print('Application records cleared; buying criteria retained.')"`

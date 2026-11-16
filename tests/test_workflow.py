@@ -127,6 +127,8 @@ def test_openai_draft_returns_first_response_directly(monkeypatch):
     monkeypatch.setattr(openai, 'OpenAI', lambda **kwargs: types.SimpleNamespace(responses=Responses()))
     result = email_agent.draft({}, {'classification':'INSUFFICIENT_DATA','missing':['arv'],'metrics':{}}, 'seller@example.com', 'Offer', original_email='Original offer details')
     assert 'Original offer details' in calls[0]['input']
+    assert 'acquisitions decision-maker' in calls[0]['instructions']
+    assert 'INSUFFICIENT_DATA' in calls[0]['input']
     assert result['body'].startswith('Direct AI draft with $999,999.') and email_agent.AI_DISCLOSURE in result['body']
     assert len(calls) == 1
 
@@ -809,7 +811,7 @@ def test_deal_reply_intent_and_missing_information():
     body = template_content({'asking_price':140000}, ev)
     assert resolution_intent(ev) == 'NEGOTIATE'
     assert '$140,000.00' in body and '$135,000.00' in body
-    assert 'closing costs' in body and 'Would the seller consider' in body
+    assert 'closing costs' in body and 'would the seller consider' in body.lower()
     ev['recommended_action'] = 'REQUEST_INFORMATION'
     assert resolution_intent(ev) == 'REQUEST_INFORMATION'
     assert 'closing costs' in template_content({}, ev)
@@ -830,7 +832,7 @@ def test_extraction_and_followup_use_direct_single_calls(monkeypatch):
     monkeypatch.setattr(config,'AI_ENABLED',True)
     monkeypatch.setattr(openai,'OpenAI',lambda **kwargs: types.SimpleNamespace(responses=responses))
     assert property_agent.extract('Offer','Dallas')[0][0]['city']=='Dallas'
-    assert email_agent.polish_followup('Draft','note','APPROVED')[0].startswith('Direct reply\n\nDisclosure:')
+    assert email_agent.polish_followup('Draft','note','APPROVED')[0].startswith('Direct reply\n\nIMPORTANT DISCLOSURE:')
     assert calls==['extract','followup']
 
 

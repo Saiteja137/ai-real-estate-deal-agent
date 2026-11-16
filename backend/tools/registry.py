@@ -3,7 +3,7 @@ import json
 from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 from backend.agents.property_agent import extract
-from backend.agents.email_agent import draft
+from backend.agents.deal_reply_agent import draft
 from backend.tools.roi_calculator import metrics
 from backend.tools.deal_evaluation import evaluate
 from backend.database import db, row, audit

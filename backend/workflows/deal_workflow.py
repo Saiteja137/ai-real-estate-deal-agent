@@ -1,5 +1,5 @@
 from backend.agents.property_agent import extract
-from backend.agents.email_agent import draft, resolution_intent
+from backend.agents.deal_reply_agent import draft, resolution_intent
 from backend.tools.deal_evaluation import evaluate
 from backend.agents.evaluation_agent import assess_property
 from backend.tools.roi_calculator import metrics
